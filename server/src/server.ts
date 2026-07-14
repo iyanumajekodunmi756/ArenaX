@@ -2,18 +2,26 @@ import dotenv from 'dotenv';
 import path from 'node:path';
 import os from 'node:os';
 import express, { Express, Request, Response } from 'express';
-import compression from 'compression';
+import {
+  createCompressionMiddleware,
+  resolveCompressionConfigFromEnv,
+} from './middleware/compression.middleware';
 import { createApp } from './app';
 import { logger } from './services/logger.service';
 import { createAdminService, getAdminService } from './services/admin.service';
 import { initEnv } from './config/env';
 import { initializeTelemetry } from './services/telemetry.service';
+import {
+  initTracing,
+  shutdownTracing,
+  traceparentResponseMiddleware,
+} from './services/tracing.service';
 import { registerAchievementIntegration } from './services/achievement.service';
 import { startHealthMonitor } from './services/health.service';
 import { Server as SocketIOServer } from 'socket.io';
 import { initGameSocket } from './websockets/game.socket';
 import { MaintenanceService } from './services/maintenance.service';
-import { getDatabaseClient } from './services/database.service';
+import { getDatabaseClient, warmPool, startPoolHealthCheck, drainPool } from './services/database.service';
 import eventMonitoringService from './services/event-monitoring.service';
 
 const nodeEnv = process.env.NODE_ENV ?? 'development';
@@ -25,6 +33,10 @@ dotenv.config({ path: path.join(root, `.env.${nodeEnv}`) });
 dotenv.config({ path: path.join(root, `.env.${nodeEnv}.local`) });
 
 const env = initEnv();
+// Tracing must initialise *before* createApp() so the OTel SDK can
+// wrap the imported express/http modules before any routes are
+// registered.
+initTracing();
 initializeTelemetry();
 registerAchievementIntegration();
 
@@ -65,7 +77,8 @@ app.get('/health', async (_req: Request, res: Response) => {
     }
 });
 
-app.use(compression());
+app.use(createCompressionMiddleware(resolveCompressionConfigFromEnv()));
+app.use(traceparentResponseMiddleware());
 
 let memoryWarningInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -93,6 +106,8 @@ const gracefulShutdown = (signal: string) => {
 
     stopMemoryMonitor();
     eventMonitoringService.stop();
+    // Best-effort: flush in-flight spans before we exit.
+    shutdownTracing().catch(() => {});
 
     if (!server) {
         logger.info('No server running, exiting');
@@ -106,8 +121,10 @@ const gracefulShutdown = (signal: string) => {
             process.exit(1);
         }
 
-        logger.info('Graceful shutdown completed');
-        process.exit(0);
+        drainPool().finally(() => {
+            logger.info('Graceful shutdown completed');
+            process.exit(0);
+        });
     });
 
     setTimeout(() => {
@@ -138,7 +155,9 @@ const waitForDatabase = async (
 
 if (env.NODE_ENV !== 'test') {
     waitForDatabase()
+        .then(() => warmPool())
         .then(() => {
+            startPoolHealthCheck({ healthCheckIntervalMs: env.HEALTH_CHECK_INTERVAL_MS });
             server = app.listen(port, () => {
                 logger.info('Server started', {
                     url: `http://localhost:${port}`,
@@ -158,21 +177,19 @@ if (env.NODE_ENV !== 'test') {
                 startMemoryMonitor();
             });
 
-    const io = new SocketIOServer(server, {
-        cors: {
-            origin: "*",
-            credentials: true
-        }
-    });
-    initGameSocket(io);
-    MaintenanceService.getInstance().setSocketServer(io);
+            const io = new SocketIOServer(server, {
+                cors: {
+                    origin: "*",
+                    credentials: true
+                }
+            });
+            initGameSocket(io);
+            MaintenanceService.getInstance().setSocketServer(io);
 
-    startHealthMonitor({ 
-        intervalMs: env.HEALTH_CHECK_INTERVAL_MS 
-    });
-
-    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-}
+            startHealthMonitor({ 
+                intervalMs: env.HEALTH_CHECK_INTERVAL_MS 
+            });
+        });
+    }
 
 export default server;

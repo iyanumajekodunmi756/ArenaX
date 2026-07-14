@@ -2,6 +2,7 @@
 pub mod achievement;
 pub mod idempotency;
 pub mod leaderboard;
+pub mod pagination;
 pub mod match_authority;
 pub mod match_models;
 pub mod matchmaker;
@@ -16,6 +17,7 @@ pub mod wallet;
 // Re-export commonly used types - explicit to avoid ambiguity
 pub use achievement::*;
 pub use idempotency::*;
+pub use pagination::{ApiResponse, PaginatedResponse, PaginationParams, DEFAULT_LIMIT, MAX_LIMIT};
 pub use leaderboard::*;
 pub use match_authority::*;
 pub use match_models::{
@@ -25,11 +27,10 @@ pub use match_models::{
     ReportScoreRequest, UserElo,
 };
 pub use matchmaker::{
-    DisputeStatus, EloHistory, EloResponse, GameModeStats, GameQueueStats, JoinQueueRequest,
-    JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, Match, MatchCandidate, MatchDispute,
-    MatchHistoryResponse, MatchmakingConfig, MatchmakingQueue, MatchmakingQueueResponse,
-    MatchmakingStats, MatchmakingStatsResponse, MatchmakingStatusResponse, MatchResult, MatchScore,
-    MatchStatus, MatchType, PlayerInfo, QueueEntry, QueueStatus, ReportScoreRequest, UserElo,
+    GameModeStats, GameQueueStats, JoinQueueRequest,
+    JoinQueueResponse, LeaveQueueRequest, LeaveQueueResponse, MatchCandidate,
+    MatchHistoryResponse, MatchmakingConfig, MatchmakingQueueResponse,
+    MatchmakingStats, QueueEntry,
 };
 pub use reward_settlement::*;
 pub use stellar_account::{

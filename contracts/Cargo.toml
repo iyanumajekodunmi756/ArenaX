@@ -1,6 +1,9 @@
 [workspace]
 members = [
+    "batch-operations",
     "arenax-events",
+    "cross-contract-utils",
+    "oracle-integration",
     "analytics",
     "game-state",
     "cross-game-assets",
@@ -29,8 +32,14 @@ members = [
     "tournament-manager",
     "virtual-economy",
     "governance",
-    "prize-distribution",
-    "random-generation",
+    "access-control",
+    "emergency-pause",
+    "time-lock",
+    "zk-proof",
+    "contract-standards",
+    "contract-utils",
+    "composable-example",
+    "token-manager",
 ]
 resolver = "2"
 

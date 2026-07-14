@@ -54,6 +54,7 @@ model User {
   tournamentRegistrations  TournamentRegistration[]
   organizedTournaments     Tournament[]
   leaderboardEntries       LeaderboardEntry[]
+  apiKeys                  ApiKey[]
 
   @@index([deletedAt])
   @@index([provider])
@@ -498,15 +499,28 @@ model AuditLog {
   targetId   String
   details        Json?
   requestId      String?
+  correlationId  String?   // cross-service correlation id
   snapshotBefore Json?
   snapshotAfter  Json?
   ipAddress      String?
   userAgent      String?
+  // tamper-evident chain
+  entryHash      String?
+  previousHash   String?
+  // blockchain anchoring
+  anchoredAt     DateTime?
+  anchorTxId     String?
+  // GDPR / retention
+  redactedAt     DateTime?
   createdAt      DateTime @default(now())
 
   @@index([adminId])
   @@index([action])
   @@index([requestId])
+  @@index([correlationId])
+  @@index([createdAt(sort: Desc)])
+  @@index([entryHash])
+  @@index([targetType, targetId])
 }
 
 enum RefundStatus {
@@ -939,3 +953,39 @@ model GameSessionEvent {
   @@index([eventType])
   @@index([timestamp])
 }
+
+model FeatureFlag {
+  id          String                 @id @default(uuid())
+  key         String                 @unique
+  description String?
+  isEnabled   Boolean                @default(false)
+  rules       Json                   @default("[]")
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+  auditLogs   FeatureFlagAuditLog[]
+}
+
+model FeatureFlagAuditLog {
+  id          String       @id @default(uuid())
+  flagId      String
+  flag        FeatureFlag  @relation(fields: [flagId], references: [id], onDelete: Cascade)
+  action      String       // CREATE, UPDATE, DELETE, TOGGLE
+  changedBy   String       // Admin user ID
+  changes     Json         // Before/after snapshot
+  createdAt   DateTime     @default(now())
+}
+
+model ApiKey {
+  id        String    @id @default(uuid())
+  key       String    @unique
+  name      String
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isActive  Boolean   @default(true)
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId])
+}
+

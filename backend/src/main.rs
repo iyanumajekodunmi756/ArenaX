@@ -19,12 +19,16 @@ use crate::config::Config;
 use crate::db::{create_pool, run_startup_migrations};
 use crate::middleware::cors_middleware;
 use crate::middleware::idempotency_middleware::IdempotencyMiddleware;
+use crate::middleware::rate_limit::RateLimitMiddleware;
 use crate::middleware::security::{SecurityConfig, SecurityMiddleware};
+use crate::service::match_authority_service::MatchAuthorityService;
 use crate::service::ReaperService;
 use crate::realtime::event_bus::EventBus;
 use crate::realtime::session_registry::SessionRegistry;
 use crate::realtime::ws_broadcaster::{WsAddressBook, WsBroadcaster};
 use crate::service::matchmaker::{MatchmakerService, MatchmakingConfig, EloEngine};
+use crate::service::soroban_service::{NetworkConfig, SorobanService};
+use crate::service::tournament_service::TournamentService;
 use crate::telemetry::init_telemetry;
 
 #[tokio::main]
@@ -72,7 +76,7 @@ async fn main() -> io::Result<()> {
         redis_conn.clone(),
         matchmaking_config,
     ));
-    
+
     // Start background matchmaker worker
     let matchmaker_worker = matchmaker_service.clone();
     tokio::spawn(async move {
@@ -85,6 +89,42 @@ async fn main() -> io::Result<()> {
     // Initialize ELO engine
     let elo_engine = Arc::new(EloEngine::new(32.0)); // K-Factor 32
 
+    // Build the shared Soroban service used for on-chain prize distribution.
+    // The network URL from config drives testnet vs mainnet selection.
+    let soroban_network = NetworkConfig::custom(
+        config.stellar.network_url.clone(),
+        if config.stellar.network_url.contains("testnet") {
+            "Test SDF Network ; September 2015".to_string()
+        } else {
+            "Public Global Stellar Network ; September 2015".to_string()
+        },
+    );
+    let soroban_service = Arc::new(SorobanService::new(soroban_network));
+
+    // Shared TournamentService wired with Soroban so distribute_prizes can
+    // execute real on-chain transfers via the prize contract.
+    let tournament_service = Arc::new(
+        TournamentService::new(db_pool.clone()).with_soroban(
+            soroban_service.clone(),
+            config.stellar.soroban_contract_prize.clone(),
+            config.stellar.admin_secret.clone(),
+        ),
+    );
+
+    // MatchAuthorityService — handles the on-chain match lifecycle FSM.
+    // The protocol signer secret is the Stellar admin key; the match
+    // lifecycle contract address is read from SOROBAN_CONTRACT_MATCH
+    // (falls back to SOROBAN_CONTRACT_PRIZE for backwards compatibility).
+    let match_authority_service = Arc::new(MatchAuthorityService::new(
+        db_pool.clone(),
+        soroban_service.clone(),
+        config.stellar.soroban_contract_match.clone(),
+    ));
+    // Store the signer secret in app_data using the SignerSecret newtype so
+    // it doesn't collide with any other web::Data<String> entries.
+    let protocol_signer_secret =
+        crate::http::match_authority_handler::SignerSecret(config.stellar.admin_secret.clone());
+
     // Initialize real-time infrastructure
     let event_bus = EventBus::new(redis_conn.clone());
     let session_registry = Arc::new(SessionRegistry::new());
@@ -92,8 +132,15 @@ async fn main() -> io::Result<()> {
 
     // Initialize Auth Services for Realtime
     let jwt_config = crate::auth::jwt_service::JwtConfig::default();
-    let jwt_service = Arc::new(crate::auth::jwt_service::JwtService::new(jwt_config, redis_conn.clone()));
+    let jwt_service = Arc::new(crate::auth::jwt_service::JwtService::new(jwt_config.clone(), redis_conn.clone()));
     let auth_guard = Arc::new(crate::realtime::auth::RealtimeAuth::new(db_pool.clone()));
+
+    // Build the AuthService used by HTTP handlers (refresh-token rotation,
+    // session management, login, register, etc.)
+    let auth_service = crate::service::auth_service::AuthService::new(
+        db_pool.clone(),
+        crate::auth::jwt_service::JwtService::new(jwt_config, redis_conn.clone()),
+    );
 
     // Start Redis Pub/Sub subscriber (broadcasts to local WebSocket actors)
     let broadcaster = WsBroadcaster::new(
@@ -109,9 +156,13 @@ async fn main() -> io::Result<()> {
         config.server.port
     );
 
+    // Snapshot the rate limit config so it can be moved into the HttpServer closure.
+    let rate_limit_config = config.rate_limit.clone();
+
     let server = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(db_pool.clone()))
+            .app_data(web::Data::new(auth_service.clone()))
             .app_data(web::Data::new(event_bus.clone()))
             .app_data(web::Data::new(session_registry.clone()))
             .app_data(web::Data::new(address_book.clone()))
@@ -119,13 +170,20 @@ async fn main() -> io::Result<()> {
             .app_data(web::Data::new(auth_guard.clone()))
             .app_data(web::Data::new(matchmaker_service.clone()))
             .app_data(web::Data::new(elo_engine.clone()))
+            .app_data(web::Data::new(tournament_service.clone()))
+            // Match authority service + protocol signer for on-chain match lifecycle
+            .app_data(web::Data::new(match_authority_service.clone()))
+            .app_data(web::Data::new(protocol_signer_secret.clone()))
             .wrap(IdempotencyMiddleware::default(db_pool.clone()))
+            .wrap(RateLimitMiddleware::new(redis_conn.clone(), rate_limit_config.clone()))
             .wrap(SecurityMiddleware::new(redis_conn.clone(), SecurityConfig::default()))
             .wrap(cors_middleware())
             .wrap(actix_web::middleware::Logger::default())
             .service(
                 web::scope("/api")
                     .route("/health", web::get().to(crate::http::health::health_check))
+                    // Auth endpoints (login, register, refresh are rate-limited strictly)
+                    .configure(crate::http::auth_handler::configure_routes)
                     .route(
                         "/notifications",
                         web::get().to(crate::http::notification_handler::get_notifications),
@@ -145,6 +203,15 @@ async fn main() -> io::Result<()> {
                     .route(
                         "/notifications/{id}",
                         web::delete().to(crate::http::notification_handler::delete_notification),
+                    )
+                    // Wallet endpoints
+                    .service(
+                        web::scope("/wallet")
+                            .route("", web::get().to(crate::http::wallet::get_wallet))
+                            .route("/transactions", web::get().to(crate::http::wallet::get_transaction_history))
+                            .route("/deposit", web::post().to(crate::http::wallet::initiate_deposit))
+                            .route("/deposit/verify", web::post().to(crate::http::wallet::verify_deposit))
+                            .route("/withdraw", web::post().to(crate::http::wallet::initiate_withdrawal))
                     )
                     // Reputation endpoints
                     .route(
@@ -185,10 +252,14 @@ async fn main() -> io::Result<()> {
                             .route("/platform", web::get().to(crate::http::analytics_handler::get_platform_metrics))
                             .route("/player/{user_id}", web::get().to(crate::http::analytics_handler::get_player_insights))
                     )
-                    // Tournament endpoints
+                    // Tournament endpoints — full lifecycle
+                    .configure(crate::http::tournament_handler::configure_routes)
+                    // Match authority endpoints — on-chain match FSM
+                    .configure(crate::http::match_authority_handler::configure_routes)
+                    // Gas endpoints
                     .service(
-                        web::scope("/tournaments")
-                            .route("/{id}/statistics", web::get().to(crate::http::tournament_handler::get_tournament_statistics))
+                        web::scope("/gas")
+                            .route("/estimate", web::post().to(crate::http::gas_estimation_handler::estimate))
                     )
                     // Matchmaking endpoints
                     .service(

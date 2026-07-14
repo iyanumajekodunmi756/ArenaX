@@ -1,4 +1,6 @@
 import { ApiResponse, ApiError } from "../types";
+import { AuthApiError } from "./authErrors";
+import type { Tournament } from "../types/tournament";
 
 class ApiClient {
   private baseURL: string;
@@ -57,7 +59,11 @@ class ApiClient {
         (json as { error?: { message?: string } })?.error?.message ??
         (json as { message?: string })?.message ??
         `HTTP ${response.status}`;
-      throw new Error(message);
+      const code =
+        (json as { error?: { code?: string } })?.error?.code ??
+        (json as { code?: string })?.code ??
+        'UNKNOWN';
+      throw new AuthApiError(message, code);
     }
     return json as T;
   }
@@ -80,10 +86,29 @@ class ApiClient {
     );
   }
 
-  async checkUsernameAvailability(username: string): Promise<{ available: boolean }> {
-    return this.request<{ available: boolean }>(
-      `/auth/username-check?username=${encodeURIComponent(username)}`
+  async verifyEmail(token: string) {
+    return this.authRequest<{ message: string }>(
+      "/auth/verify-email",
+      { method: "POST", body: JSON.stringify({ token }) }
     );
+  }
+
+  async resendVerificationEmail(email: string) {
+    return this.authRequest<{ message: string }>(
+      "/auth/resend-verification-email",
+      { method: "POST", body: JSON.stringify({ email }) }
+    );
+  }
+
+  async getProfile() {
+    return this.request<{
+      id: string;
+      username: string;
+      email: string | null;
+      is_verified: boolean;
+      created_at: string;
+      elo?: number;
+    }>("/users/me");
   }
 
   // Tournament endpoints
@@ -92,8 +117,8 @@ class ApiClient {
     return this.request(`/tournaments${queryString}`);
   }
 
-  async getTournament(id: string) {
-    return this.request(`/tournaments/${id}`);
+  async getTournament(id: string): Promise<Tournament> {
+    return this.request<Tournament>(`/tournaments/${id}`);
   }
 
   async createTournament(tournament: any) {
@@ -226,11 +251,19 @@ class ApiClient {
     return this.request("/admin/disputes");
   }
 
-  async resolveDispute(id: string, data: { status: string; resolution?: string; winnerOverrideId?: string }) {
+  async resolveDispute(id: string, data: { status: string; resolution: string; winnerOverrideId?: string }) {
     return this.request(`/admin/disputes/${id}/resolve`, {
       method: "POST",
       body: JSON.stringify(data),
     });
+  }
+
+  async getActiveMatches(): Promise<import("../types/match").MatchWithPlayers[]> {
+    try {
+      return await this.request<import("../types/match").MatchWithPlayers[]>("/matches?status=in_progress&mine=true");
+    } catch {
+      return [];
+    }
   }
 
   async getAuditLogs(params?: Record<string, any>) {
