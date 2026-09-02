@@ -19,8 +19,18 @@ import {
   Play,
   ArrowLeft,
   Users,
+  AlertTriangle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 interface MatchDetailViewProps {
   match: MatchDetail;
@@ -36,9 +46,55 @@ export function MatchDetailView({
   const isWinner = match.winnerId === currentUserId;
   const player1Won = match.winnerId === match.player1Id;
   const player2Won = match.winnerId === match.player2Id;
+  const isDisputed = match.status === "disputed";
+
+  const replayUrl = match.replayUrl?.trim() ?? "";
+  const hasReplay = replayUrl.length > 0 && isValidHttpUrl(replayUrl);
 
   return (
     <div className="space-y-6">
+      {isDisputed && (
+        <div className="flex flex-col gap-2 rounded-lg border border-warning/50 bg-warning/10 p-4">
+          <div className="flex items-center gap-2 text-warning font-semibold text-lg">
+            <AlertTriangle className="h-5 w-5" />
+            Under Review
+          </div>
+          <p className="text-sm text-muted-foreground">
+            This match is currently under dispute review. An admin will evaluate
+            both submitted scores and reach a decision.
+          </p>
+          {match.disputeDeadline && (
+            <p className="text-sm flex items-center gap-2 text-muted-foreground">
+              <Calendar className="h-4 w-4" />
+              Dispute deadline:{" "}
+              <span className="font-medium">
+                {new Date(match.disputeDeadline).toLocaleString()}
+              </span>
+            </p>
+          )}
+          <div className="flex items-center gap-4 mt-1">
+            <div className="flex-1 rounded-md border bg-muted/50 p-3 text-center">
+              <p className="text-xs text-muted-foreground mb-1">
+                {match.player1Username}
+              </p>
+              <p className="text-2xl font-bold">{match.scorePlayer1 ?? "—"}</p>
+            </div>
+            <span className="text-muted-foreground font-medium">vs</span>
+            <div className="flex-1 rounded-md border bg-muted/50 p-3 text-center">
+              <p className="text-xs text-muted-foreground mb-1">
+                {match.player2Username}
+              </p>
+              <p className="text-2xl font-bold">{match.scorePlayer2 ?? "—"}</p>
+            </div>
+          </div>
+          <a
+            href="mailto:support@arenax.gg"
+            className="text-sm text-primary underline-offset-4 hover:underline mt-1"
+          >
+            Contact support
+          </a>
+        </div>
+      )}
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
@@ -52,15 +108,20 @@ export function MatchDetailView({
               </p>
             </div>
             <div className="flex gap-2">
-              {match.replayUrl && (
+              {hasReplay && (
                 <Button variant="outline" size="sm" asChild>
-                  <Link href={match.replayUrl}>
-                    <Play className="h-4 w-4 mr-2" />
+                  <a
+                    href={replayUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label="Watch match replay (opens in new tab)"
+                  >
+                    <Play className="h-4 w-4 mr-2" aria-hidden="true" />
                     Watch Replay
-                  </Link>
+                  </a>
                 </Button>
               )}
-              {match.canDispute && (
+              {match.canDispute && !isDisputed && (
                 <Button variant="outline" size="sm" onClick={onReportIssue}>
                   <Flag className="h-4 w-4 mr-2" />
                   Report Issue
@@ -74,7 +135,7 @@ export function MatchDetailView({
             <div
               className={cn(
                 "text-center flex-1",
-                player1Won ? "text-green-600 dark:text-green-400" : "",
+                player1Won ? "text-success dark:text-success/80" : "",
               )}
             >
               <p className="text-2xl font-bold">{match.player1Username}</p>
@@ -92,7 +153,7 @@ export function MatchDetailView({
             <div
               className={cn(
                 "text-center flex-1",
-                player2Won ? "text-green-600 dark:text-green-400" : "",
+                player2Won ? "text-success dark:text-success/80" : "",
               )}
             >
               <p className="text-2xl font-bold">{match.player2Username}</p>
@@ -193,12 +254,12 @@ export function MatchDetailView({
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="flex items-center justify-between p-3 bg-green-50 dark:bg-green-900/20 rounded-lg">
+              <div className="flex items-center justify-between p-3 bg-success-muted dark:bg-success-muted/20 rounded-lg">
                 <div className="flex items-center gap-2">
-                  <Trophy className="h-5 w-5 text-green-600" />
+                  <Trophy className="h-5 w-5 text-success" />
                   <span className="font-medium">Winner</span>
                 </div>
-                <span className="text-xl font-bold text-green-600">
+                <span className="text-xl font-bold text-success">
                   {match.prizeDistribution.currency || "$"}
                   {match.prizeDistribution.winner.toLocaleString()}
                 </span>
@@ -245,15 +306,15 @@ function RoundRow({
 }) {
   const winnerColor =
     round.winner === "player1"
-      ? "text-green-600 dark:text-green-400"
+      ? "text-success dark:text-success/80"
       : round.winner === "player2"
-        ? "text-blue-600 dark:text-blue-400"
+        ? "text-primary dark:text-primary/80"
         : "";
   const winnerBg =
     round.winner === "player1"
-      ? "bg-green-50 dark:bg-green-900/20"
+      ? "bg-success-muted dark:bg-success-muted/20"
       : round.winner === "player2"
-        ? "bg-blue-50 dark:bg-blue-900/20"
+        ? "bg-info-muted dark:bg-info-muted/20"
         : "";
 
   return (
@@ -408,11 +469,11 @@ function ScoreProgressionChart({ match }: { match: MatchDetail }) {
 
       <div className="flex items-center justify-center gap-6 mt-4">
         <div className="flex items-center gap-2">
-          <div className="w-3 h-3 rounded-full bg-green-500" />
+          <div className="w-3 h-3 rounded-full bg-success" />
           <span className="text-sm">{match.player1Username}</span>
         </div>
         <div className="flex items-center gap-2">
-          <div className="w-3 h-3 rounded-full bg-blue-500" />
+          <div className="w-3 h-3 rounded-full bg-primary" />
           <span className="text-sm">{match.player2Username}</span>
         </div>
       </div>
@@ -428,12 +489,12 @@ function PlayerStatsCard({
   isWinner: boolean;
 }) {
   return (
-    <Card className={isWinner ? "border-green-200 dark:border-green-800" : ""}>
+    <Card className={isWinner ? "border-success/30 dark:border-green-800" : ""}>
       <CardHeader>
         <CardTitle
           className={cn(
             "flex items-center gap-2",
-            isWinner ? "text-green-600 dark:text-green-400" : "",
+            isWinner ? "text-success dark:text-success/80" : "",
           )}
         >
           {isWinner && <Trophy className="h-5 w-5" />}

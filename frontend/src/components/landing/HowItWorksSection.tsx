@@ -2,6 +2,7 @@
 
 import { motion } from "framer-motion";
 import { UserPlus, Trophy, Swords, Wallet } from "lucide-react";
+import { useReducedMotion } from "@/hooks/useReducedMotion";
 
 const steps = [
   {
@@ -34,16 +35,26 @@ const steps = [
 ];
 
 export function HowItWorksSection() {
+  const prefersReducedMotion = useReducedMotion();
+
   return (
-    <section className="container py-8 md:py-12 lg:py-24">
+    <section
+      aria-labelledby="how-it-works-heading"
+      className="container py-8 md:py-12 lg:py-24"
+    >
       <motion.div
-        initial={{ opacity: 0, y: 20 }}
-        whileInView={{ opacity: 1, y: 0 }}
+        initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: 20 }}
+        whileInView={
+          prefersReducedMotion ? { opacity: 1 } : { opacity: 1, y: 0 }
+        }
         viewport={{ once: true }}
-        transition={{ duration: 0.5 }}
+        transition={prefersReducedMotion ? { duration: 0 } : { duration: 0.5 }}
         className="mx-auto flex max-w-[58rem] flex-col items-center justify-center gap-4 text-center"
       >
-        <h2 className="font-heading text-3xl leading-[1.1] sm:text-3xl md:text-6xl">
+        <h2
+          id="how-it-works-heading"
+          className="font-heading text-3xl leading-[1.1] sm:text-3xl md:text-6xl"
+        >
           How it Works
         </h2>
         <p className="max-w-[85%] leading-normal text-muted-foreground sm:text-lg sm:leading-7">
@@ -54,10 +65,18 @@ export function HowItWorksSection() {
         {steps.map((step, index) => (
           <motion.div
             key={step.number}
-            initial={{ opacity: 0, y: 20 }}
-            whileInView={{ opacity: 1, y: 0 }}
+            initial={
+              prefersReducedMotion ? { opacity: 1 } : { opacity: 0, y: 20 }
+            }
+            whileInView={
+              prefersReducedMotion ? { opacity: 1 } : { opacity: 1, y: 0 }
+            }
             viewport={{ once: true }}
-            transition={{ duration: 0.5, delay: index * 0.1 }}
+            transition={
+              prefersReducedMotion
+                ? { duration: 0 }
+                : { duration: 0.5, delay: index * 0.1 }
+            }
             className="relative flex flex-col items-center text-center gap-2 px-4"
           >
             <span className="text-6xl font-bold text-muted/30 absolute -top-8 select-none">

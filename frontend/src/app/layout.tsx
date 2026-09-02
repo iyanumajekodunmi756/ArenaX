@@ -8,10 +8,13 @@ import { AuthProvider } from "@/hooks/useAuth";
 import { TxStatusProvider } from "@/hooks/useTxStatus";
 import { WalletProvider } from "@/hooks/useWallet";
 import { NotificationProvider } from "@/contexts/NotificationContext";
+import { WebVitalsInit } from "@/components/providers/WebVitalsInit";
+import { AnalyticsProvider } from "@/components/providers/AnalyticsProvider";
+import { ConsentBanner } from "@/components/providers/ConsentBanner";
+import { defaultMetadata, organizationStructuredData, websiteStructuredData } from "@/lib/seo";
 
 export const metadata: Metadata = {
-  title: "ArenaX",
-  description: "Competitive Gaming Platform",
+  ...defaultMetadata,
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
@@ -35,6 +38,16 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: organizationStructuredData() }}
+        />
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: websiteStructuredData() }}
+        />
+      </head>
       <body className="font-sans antialiased">
         <ThemeProvider
           attribute="class"
@@ -48,7 +61,11 @@ export default function RootLayout({
                 <WalletProvider>
                   <TxStatusProvider>
                     <NotificationProvider>
-                      <AppLayout>{children}</AppLayout>
+                      <AnalyticsProvider>
+                        <WebVitalsInit />
+                        <AppLayout>{children}</AppLayout>
+                        <ConsentBanner />
+                      </AnalyticsProvider>
                     </NotificationProvider>
                   </TxStatusProvider>
                 </WalletProvider>

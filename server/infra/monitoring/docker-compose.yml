@@ -1,0 +1,93 @@
+version: '3.8'
+
+# Prometheus + Alertmanager + Grafana monitoring stack for #661 / #970.
+#
+# arenax-server already exposes Prometheus-format metrics at
+# `/api/metrics` via prom-client (src/services/metrics.service.ts,
+# src/routes/metrics.routes.ts), and arenax-backend (the Rust service)
+# now exposes them at `/metrics` (backend/src/metrics.rs) — this stack
+# scrapes both, so the two services are covered by one unified monitoring
+# setup instead of each needing its own. Alertmanager fans firing alerts
+# out to PagerDuty per the routing/severity policy in alertmanager.yml.
+#
+# Usage:
+#   mkdir -p server/infra/monitoring/secrets
+#   echo -n '<pagerduty critical service integration key>' > server/infra/monitoring/secrets/pagerduty_critical_routing_key
+#   echo -n '<pagerduty warning service integration key>'  > server/infra/monitoring/secrets/pagerduty_warning_routing_key
+#   docker compose -f server/infra/monitoring/docker-compose.yml up -d
+#   open http://localhost:9090   # Prometheus
+#   open http://localhost:9093   # Alertmanager
+#   open http://localhost:3002   # Grafana (admin / admin, change on first login)
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+      - ./backend-alert.rules.yml:/etc/prometheus/backend-alert.rules.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      alertmanager:
+        condition: service_healthy
+    networks:
+      - monitoring-network
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # PagerDuty Events API v2 integration keys, one secret per file —
+      # see the Usage block above. Never commit real keys; this directory
+      # is gitignored.
+      - ./secrets:/etc/alertmanager/secrets:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    ports:
+      - "9093:9093"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - monitoring-network
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "3002:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks:
+      - monitoring-network
+
+networks:
+  monitoring-network:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

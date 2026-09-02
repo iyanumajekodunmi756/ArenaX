@@ -1,4 +1,8 @@
 #![no_std]
+// `Events::publish` is deprecated in favor of the `#[contractevent]` macro;
+// this contract's events predate that macro's availability and migrating
+// their wire format is out of scope here.
+#![allow(deprecated)]
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
 
@@ -25,8 +29,15 @@ pub struct StakingPosition {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StakingPositionOption {
+    None,
+    Some(StakingPosition),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StakingInfo {
-    pub position: Option<StakingPosition>,
+    pub position: StakingPositionOption,
     pub claimable_rewards: i128,
     pub reward_pool: i128,
     pub total_staked: i128,
@@ -43,6 +54,7 @@ pub enum DataKey {
     TotalStaked,
     Stake(Address),
     EpochDistributed(u64),
+    GlobalPauseContract,
 }
 
 #[contract]
@@ -88,7 +100,7 @@ impl StakingRewardsContract {
         }
 
         let token = Self::token(&env);
-        token::Client::new(&env, &token).transfer(&user, &env.current_contract_address(), &amount);
+        token::Client::new(&env, &token).transfer(&user, env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
         let key = DataKey::Stake(user.clone());
@@ -291,7 +303,7 @@ impl StakingRewardsContract {
     }
 
     pub fn get_staking_info(env: Env, user: Address) -> StakingInfo {
-        let position = env
+        let position_opt = env
             .storage()
             .persistent()
             .get::<DataKey, StakingPosition>(&DataKey::Stake(user.clone()));
@@ -305,7 +317,7 @@ impl StakingRewardsContract {
             .instance()
             .get::<DataKey, i128>(&DataKey::TotalStaked)
             .unwrap_or(0);
-        let claimable_rewards = position
+        let claimable_rewards = position_opt
             .clone()
             .map(|p| {
                 let params: RewardParams = env
@@ -317,6 +329,11 @@ impl StakingRewardsContract {
                     + p.pending_rewards
             })
             .unwrap_or(0);
+
+        let position = match position_opt {
+            Some(pos) => StakingPositionOption::Some(pos),
+            None => StakingPositionOption::None,
+        };
 
         StakingInfo {
             position,
@@ -348,11 +365,7 @@ impl StakingRewardsContract {
             panic!("amount must be positive");
         }
         let token = Self::token(&env);
-        token::Client::new(&env, &token).transfer(
-            &funder,
-            &env.current_contract_address(),
-            &amount,
-        );
+        token::Client::new(&env, &token).transfer(&funder, env.current_contract_address(), &amount);
         let pool = env
             .storage()
             .instance()
@@ -392,6 +405,13 @@ impl StakingRewardsContract {
         env.storage().instance().set(&DataKey::Paused, &paused);
     }
 
+    pub fn set_global_pause_contract(env: Env, global_pause: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalPauseContract, &global_pause);
+    }
+
     fn calculate_position_rewards(
         position: &StakingPosition,
         params: &RewardParams,
@@ -426,6 +446,25 @@ impl StakingRewardsContract {
             .unwrap_or(false)
         {
             panic!("contract is paused");
+        }
+        if let Some(global_pause) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::GlobalPauseContract)
+        {
+            use soroban_sdk::IntoVal;
+            let is_paused: bool = env.invoke_contract(
+                &global_pause,
+                &soroban_sdk::Symbol::new(env, "is_paused"),
+                (
+                    env.current_contract_address(),
+                    Option::<soroban_sdk::Symbol>::None,
+                )
+                    .into_val(env),
+            );
+            if is_paused {
+                panic!("contract execution is paused");
+            }
         }
     }
 

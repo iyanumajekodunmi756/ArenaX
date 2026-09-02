@@ -1,5 +1,9 @@
 // Reward distribution system
-use crate::error::VirtualEconomyError;
+//
+// A reusable calculation library not yet wired into the contract's public
+// entry points in lib.rs.
+#![allow(dead_code)]
+
 use crate::storage::*;
 use soroban_sdk::{Address, Env, String, Vec};
 
@@ -9,7 +13,7 @@ impl RewardManager {
     /// Calculate tournament rewards based on placement and prize pool
     pub fn calculate_tournament_rewards(
         total_prize_pool: i128,
-        player_count: u32,
+        _player_count: u32,
         placement: u32,
     ) -> i128 {
         // Standard tournament payout structure
@@ -55,6 +59,8 @@ impl RewardManager {
 
     /// Calculate achievement rewards based on rarity and difficulty
     pub fn calculate_achievement_rewards(
+        env: &Env,
+        creator: &Address,
         achievement_type: AchievementType,
         difficulty: u32, // 1-5 scale
     ) -> RewardType {
@@ -68,15 +74,17 @@ impl RewardManager {
                 if difficulty >= 4 {
                     // High difficulty tournaments give NFT rewards
                     RewardType::NFT(NFTMetadata {
-                        name: String::from_str(&env, "Tournament Champion"),
+                        name: String::from_str(env, "Tournament Champion"),
                         description: String::from_str(
-                            &env,
+                            env,
                             "Awarded for winning a high-level tournament",
                         ),
-                        image_url: String::from_str(&env, "https://assets.arenax.gg/champion.png"),
-                        attributes: Vec::new(&env),
+                        image_url: String::from_str(env, "https://assets.arenax.gg/champion.png"),
+                        attributes: Vec::new(env),
                         rarity: difficulty,
-                        category: String::from_str(&env, "Achievement"),
+                        category: String::from_str(env, "Achievement"),
+                        creator: creator.clone(),
+                        royalty_bps: 0, // Achievement NFTs don't have royalties
                     })
                 } else {
                     RewardType::Currency(500 * difficulty as i128)
@@ -89,7 +97,7 @@ impl RewardManager {
     /// Distribute seasonal rewards to active players
     pub fn calculate_seasonal_rewards(
         player_activity_score: i128,
-        season_length_days: u32,
+        _season_length_days: u32,
         total_seasonal_pool: i128,
         active_players: u32,
     ) -> i128 {

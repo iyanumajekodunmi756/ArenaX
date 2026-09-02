@@ -1,3 +1,5 @@
+import type { BracketMatch, ScoreReport } from "./bracket";
+
 // Match-related types
 export interface Match {
   id: string;
@@ -37,10 +39,19 @@ export interface MatchResult {
 export interface MatchFilters {
   tournamentId?: string;
   playerId?: string;
+  userId?: string;
   status?: MatchStatus;
   gameType?: string;
+  mine?: boolean;
   page?: number;
   limit?: number;
+}
+
+export interface ReportScoreRequest {
+  score: number;
+  opponentScore: number;
+  proofUrl?: string;
+  telemetryData?: Record<string, unknown>;
 }
 
 // Enhanced types for detailed match view
@@ -86,3 +97,87 @@ export interface MatchDetail extends MatchWithPlayers {
   canDispute?: boolean;
   disputeDeadline?: string;
 }
+
+export interface MatchHubEvent {
+  id: string;
+  type: "status" | "score" | "alert" | "report";
+  message: string;
+  createdAt: string;
+}
+
+export interface MatchHubPlayerSnapshot {
+  id: string;
+  username: string;
+  avatar?: string;
+  elo: number;
+  region: string;
+  seed: number;
+  record: string;
+  stats: Array<{ label: string; value: string }>;
+}
+
+export interface MatchHubDetails {
+  id: string;
+  tournamentId: string;
+  tournamentName: string;
+  gameType: string;
+  bracketFormat: "single_elimination" | "double_elimination";
+  roundLabel: string;
+  arenaLabel: string;
+  status: BracketMatch["status"];
+  bestOf: number;
+  scheduledTime: string;
+  startedAt?: string;
+  streamTitle?: string;
+  prizePool: number;
+  player1: MatchHubPlayerSnapshot;
+  player2: MatchHubPlayerSnapshot;
+  scorePlayer1: number;
+  scorePlayer2: number;
+  winnerId?: string;
+  notes: string;
+  reports: ScoreReport[];
+  feed: MatchHubEvent[];
+  canDisputeUntil: string;
+  /** Spectator mode configuration */
+  spectatorLimit?: number;
+  replayUrl?: string;
+}
+
+// ─── Spectator Mode Types ──────────────────────────────────────────────────────
+
+/** Which player's perspective the spectator is viewing */
+export type SpectatorPerspective = "player1" | "player2" | "overview";
+
+/** A single spectator chat message */
+export interface SpectatorChatMessage {
+  id: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  createdAt: number;
+  /** True while the message is optimistically rendered before server confirmation */
+  optimistic?: boolean;
+}
+
+/** Live spectator update received over WebSocket */
+export interface SpectatorUpdate {
+  matchId: string;
+  spectatorCount: number;
+  scorePlayer1?: number;
+  scorePlayer2?: number;
+  status?: BracketMatch["status"];
+  winnerId?: string;
+  /** Narrative event text (e.g. "ProGamer99 takes the lead!") */
+  eventMessage?: string;
+  timestamp: number;
+}
+
+/** State of the spectator WebSocket connection */
+export type SpectatorConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "disconnected"
+  | "error";

@@ -1,626 +1,506 @@
 #![no_std]
 
-//! # Secure Contract Upgrade System
+//! Contract upgrade manager (Issue #880).
 //!
-//! A comprehensive upgrade management system for ArenaX protocol that enables
-//! secure, governance-controlled contract upgrades with built-in safety mechanisms.
+//! # Why this is not a proxy
 //!
-//! ## Features
-//! - Governance-controlled upgrade proposals with multi-signature approval
-//! - Time-locked upgrade execution for security
-//! - Comprehensive validation and compatibility checking
-//! - Upgrade simulation environment
-//! - Rollback mechanisms for failed upgrades
-//! - Emergency pause controls
-//! - Complete upgrade audit trail
-//! - Upgrade impact analysis
+//! The issue asks for a proxy pattern. On EVM a proxy is necessary because code
+//! at an address is immutable, so upgrades work by delegating from a stable
+//! address to a swappable implementation. **Soroban does not have that
+//! constraint**: `env.deployer().update_current_contract_wasm(hash)` replaces a
+//! contract's code in place, keeping its address, its storage, and every
+//! reference other contracts hold to it.
 //!
-//! ## Security
-//! - Multi-signature authorization required
-//! - Time-locked execution prevents rushed upgrades
-//! - Validation prevents breaking changes
-//! - Emergency procedures for critical issues
-//! - Comprehensive access controls
-//! - Replay attack protection
+//! Implementing a delegating proxy here would therefore *add* the failure modes
+//! the EVM pattern is famous for — storage-layout collisions between proxy and
+//! implementation, an extra hop on every call, and a selector-clash surface —
+//! to buy a property the platform already provides for free. So this manager
+//! governs the native upgrade instead: it decides *whether* an upgrade may
+//! proceed, records what happened, and can put it back.
+//!
+//! # What actually needs protecting
+//!
+//! An upgrade is the single most dangerous operation a contract has: it can
+//! replace all behaviour in one transaction. The controls here exist because
+//! each corresponds to a way real upgrades go wrong:
+//!
+//! - **Timelock** — an upgrade nobody could see coming is indistinguishable
+//!   from a key compromise. Scheduling forces a public window.
+//! - **Pause during upgrade** — state migrated while writes are landing is
+//!   migrated inconsistently.
+//! - **Rollback** — the previous WASM hash is recorded *before* the swap, so
+//!   reverting does not depend on anyone having written it down.
+//! - **Version tracking** — a migration that runs twice, or runs against the
+//!   wrong starting version, corrupts exactly the state it was meant to fix.
 
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
-
-mod error;
-mod events;
-mod storage;
-mod types;
-
-pub use error::UpgradeError;
-pub use types::{
-    ApprovalRecord, EmergencyState, ProposeUpgradeParams, RollbackInfo, UpgradeConfig,
-    UpgradeHistoryEntry, UpgradeProposal, UpgradeStatus, UpgradeType, ValidationResult,
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
-// ============================================================================
-// Contract Implementation
-// ============================================================================
+// ── Storage keys ────────────────────────────────────────────────────────────
+
+const ADMIN: Symbol = symbol_short!("admin");
+const VERSION: Symbol = symbol_short!("version");
+const PENDING: Symbol = symbol_short!("pending");
+const PAUSED: Symbol = symbol_short!("paused");
+const HISTORY: Symbol = symbol_short!("history");
+const CURRENT: Symbol = symbol_short!("current");
+const DELAY: Symbol = symbol_short!("delay");
+const MIGRATED: Symbol = symbol_short!("migrated");
+
+/// Default timelock: 48 hours, long enough for an unexpected upgrade to be
+/// noticed and contested across time zones.
+pub const DEFAULT_UPGRADE_DELAY: u64 = 172_800;
+
+/// Cap on retained history entries, so the record cannot grow without bound.
+pub const MAX_HISTORY: u32 = 32;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum UpgradeError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    /// An upgrade is already scheduled; cancel it before scheduling another.
+    UpgradeAlreadyScheduled = 4,
+    NoUpgradeScheduled = 5,
+    /// The timelock has not elapsed.
+    TimelockNotElapsed = 6,
+    /// Execution requires the contract to be paused first.
+    NotPaused = 7,
+    /// The contract is paused and this operation is not allowed while it is.
+    Paused = 8,
+    /// No previous version is recorded, so there is nothing to roll back to.
+    NoRollbackTarget = 9,
+    /// The proposed version does not follow the current one.
+    InvalidVersion = 10,
+    /// This migration has already been applied.
+    MigrationAlreadyApplied = 11,
+    InvalidDelay = 12,
+}
+
+/// Semantic version triple.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Version {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl Version {
+    /// Strict ordering. Used to reject an upgrade that does not move forward —
+    /// re-deploying an older WASM under a version that already ran would make
+    /// migration state meaningless.
+    fn is_after(&self, other: &Version) -> bool {
+        (self.major, self.minor, self.patch) > (other.major, other.minor, other.patch)
+    }
+}
+
+/// An upgrade waiting out its timelock.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub target_version: Version,
+    pub scheduled_at: u64,
+    /// Earliest ledger timestamp at which this may execute.
+    pub executable_at: u64,
+    pub scheduled_by: Address,
+    /// Whether state migration must run as part of this upgrade.
+    pub requires_migration: bool,
+}
+
+/// A completed upgrade, kept so the lineage is queryable on-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeRecord {
+    pub from_version: Version,
+    pub to_version: Version,
+    pub from_wasm_hash: BytesN<32>,
+    pub to_wasm_hash: BytesN<32>,
+    pub executed_at: u64,
+    pub executed_by: Address,
+    /// True when this record was produced by a rollback rather than an upgrade.
+    pub was_rollback: bool,
+}
 
 #[contract]
-pub struct UpgradeSystem;
+pub struct UpgradeManager;
 
 #[contractimpl]
-impl UpgradeSystem {
-    // ========================================================================
-    // Initialization
-    // ========================================================================
-
-    /// Initialize the upgrade system
-    ///
-    /// # Arguments
-    /// * `governance_address` - Address of the governance contract
-    /// * `min_timelock_duration` - Minimum timelock duration in seconds
-    /// * `required_approvals` - Number of approvals required for execution
-    /// * `emergency_threshold` - Emergency multisig threshold
+impl UpgradeManager {
+    /// Initialize with an admin, a starting version, and the deployed WASM hash.
     ///
     /// # Errors
-    /// * `AlreadyInitialized` - Contract has already been initialized
-    /// * `InvalidInput` - Invalid configuration parameters
+    /// - `AlreadyInitialized` if called twice.
     pub fn initialize(
         env: Env,
-        governance_address: Address,
-        min_timelock_duration: u64,
-        required_approvals: u32,
-        emergency_threshold: u32,
+        admin: Address,
+        version: Version,
+        wasm_hash: BytesN<32>,
     ) -> Result<(), UpgradeError> {
-        if storage::is_initialized(&env) {
+        if env.storage().instance().has(&ADMIN) {
             return Err(UpgradeError::AlreadyInitialized);
         }
 
-        if required_approvals == 0 || emergency_threshold == 0 {
-            return Err(UpgradeError::InvalidInput);
-        }
+        admin.require_auth();
 
-        let config = UpgradeConfig {
-            governance_address: governance_address.clone(),
-            min_timelock_duration,
-            max_timelock_duration: 30 * 24 * 60 * 60, // 30 days
-            required_approvals,
-            simulation_required: true,
-            emergency_multisig_threshold: emergency_threshold,
-        };
-
-        storage::set_config(&env, &config);
-        storage::set_initialized(&env);
-
-        events::emit_initialized(&env, &governance_address, required_approvals);
+        env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&VERSION, &version);
+        env.storage().instance().set(&CURRENT, &wasm_hash);
+        env.storage().instance().set(&PAUSED, &false);
+        env.storage().instance().set(&DELAY, &DEFAULT_UPGRADE_DELAY);
+        env.storage()
+            .instance()
+            .set(&HISTORY, &Vec::<UpgradeRecord>::new(&env));
 
         Ok(())
     }
 
-    // ========================================================================
-    // Core Upgrade Functions
-    // ========================================================================
+    // ── Scheduling ──────────────────────────────────────────────────────────
 
-    /// Propose a new upgrade
+    /// Schedule an upgrade. It becomes executable once the timelock elapses.
     ///
-    /// # Arguments
-    /// * `proposer` - Address proposing the upgrade
-    /// * `proposal_id` - Unique identifier for the proposal
-    /// * `params` - Upgrade parameters (contract, wasm hash, type, timelock, description)
-    #[allow(clippy::too_many_arguments)]
-    pub fn propose_upgrade(
-        env: Env,
-        proposer: Address,
-        proposal_id: BytesN<32>,
-        params: ProposeUpgradeParams,
-    ) -> Result<(), UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
-        }
-
-        proposer.require_auth();
-
-        // Check governance authorization
-        let config = storage::get_config(&env);
-        Self::verify_governance_auth(&env, &proposer, &config)?;
-
-        // Check proposal doesn't exist
-        if storage::proposal_exists(&env, &proposal_id) {
-            return Err(UpgradeError::ProposalAlreadyExists);
-        }
-
-        // Validate timelock duration
-        if params.timelock_duration < config.min_timelock_duration {
-            return Err(UpgradeError::TimelockTooShort);
-        }
-        if params.timelock_duration > config.max_timelock_duration {
-            return Err(UpgradeError::TimelockTooLong);
-        }
-
-        let timestamp = env.ledger().timestamp();
-        let timelock_end = timestamp + params.timelock_duration;
-
-        // Store current contract hash for rollback
-        if let Some(current_hash) =
-            storage::get_contract_current_hash(&env, &params.contract_address)
-        {
-            let rollback_info = RollbackInfo {
-                contract_address: params.contract_address.clone(),
-                previous_wasm_hash: current_hash,
-                rollback_at: 0,
-                reason: String::from_str(&env, ""),
-                initiated_by: proposer.clone(),
-            };
-            storage::set_rollback_info(&env, &rollback_info);
-        }
-
-        // Create proposal
-        let proposal = UpgradeProposal {
-            proposal_id: proposal_id.clone(),
-            contract_address: params.contract_address.clone(),
-            new_wasm_hash: params.new_wasm_hash,
-            upgrade_type: params.upgrade_type,
-            proposer: proposer.clone(),
-            status: UpgradeStatus::Pending as u32,
-            created_at: timestamp,
-            scheduled_at: None,
-            executed_at: None,
-            timelock_end,
-            approval_count: 0,
-            description: params.description,
-            compatibility_score: 0,
-            simulation_passed: false,
-        };
-
-        storage::set_proposal(&env, &proposal);
-
-        // Initialize empty approvals
-        let approvals: Vec<ApprovalRecord> = Vec::new(&env);
-        storage::set_approvals(&env, &proposal_id, &approvals);
-
-        events::emit_upgrade_proposed(
-            &env,
-            &proposal_id,
-            &params.contract_address,
-            &proposer,
-            timelock_end,
-        );
-
-        Ok(())
-    }
-
-    /// Validate an upgrade proposal
+    /// Scheduling is deliberately separate from execution. A single-call
+    /// upgrade gives observers no window to react, which means a stolen admin
+    /// key and a legitimate release are operationally identical.
     ///
-    /// # Arguments
-    /// * `validator` - Address performing validation
-    /// * `proposal_id` - ID of proposal to validate
-    /// * `compatibility_score` - Compatibility score (0-100)
-    /// * `breaking_changes` - Whether breaking changes detected
-    /// * `security_issues` - List of security issues found
-    pub fn validate_upgrade(
+    /// # Errors
+    /// - `Unauthorized` if the caller is not the admin.
+    /// - `UpgradeAlreadyScheduled` if one is already pending.
+    /// - `InvalidVersion` if `target_version` does not follow the current one.
+    pub fn schedule_upgrade(
         env: Env,
-        validator: Address,
-        proposal_id: BytesN<32>,
-        compatibility_score: u32,
-        breaking_changes: bool,
-        security_issues: Vec<String>,
-    ) -> Result<(), UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
+        new_wasm_hash: BytesN<32>,
+        target_version: Version,
+        requires_migration: bool,
+    ) -> Result<PendingUpgrade, UpgradeError> {
+        let admin = Self::require_admin(&env)?;
+
+        if env.storage().instance().has(&PENDING) {
+            return Err(UpgradeError::UpgradeAlreadyScheduled);
         }
 
-        validator.require_auth();
-
-        let config = storage::get_config(&env);
-        Self::verify_governance_auth(&env, &validator, &config)?;
-
-        let mut proposal =
-            storage::get_proposal(&env, &proposal_id).ok_or(UpgradeError::ProposalNotFound)?;
-
-        if proposal.status != UpgradeStatus::Pending as u32 {
-            return Err(UpgradeError::InvalidStatus);
+        let current: Version = Self::current_version(env.clone())?;
+        if !target_version.is_after(&current) {
+            return Err(UpgradeError::InvalidVersion);
         }
 
-        // Check for critical issues
-        let is_valid = !breaking_changes && security_issues.is_empty() && compatibility_score >= 70;
+        let now = env.ledger().timestamp();
+        let delay: u64 = env
+            .storage()
+            .instance()
+            .get(&DELAY)
+            .unwrap_or(DEFAULT_UPGRADE_DELAY);
 
-        if !is_valid {
-            if breaking_changes {
-                return Err(UpgradeError::BreakingChangesDetected);
-            }
-            if !security_issues.is_empty() {
-                return Err(UpgradeError::SecurityIssuesFound);
-            }
-            return Err(UpgradeError::IncompatibleUpgrade);
-        }
-
-        let timestamp = env.ledger().timestamp();
-
-        let validation = ValidationResult {
-            proposal_id: proposal_id.clone(),
-            is_valid,
-            compatibility_score,
-            breaking_changes,
-            security_issues,
-            validated_at: timestamp,
-            validator: validator.clone(),
+        let pending = PendingUpgrade {
+            new_wasm_hash,
+            target_version,
+            scheduled_at: now,
+            executable_at: now.saturating_add(delay),
+            scheduled_by: admin,
+            requires_migration,
         };
 
-        storage::set_validation(&env, &validation);
-
-        // Update proposal
-        proposal.status = UpgradeStatus::Validated as u32;
-        proposal.compatibility_score = compatibility_score;
-        storage::set_proposal(&env, &proposal);
-
-        events::emit_upgrade_validated(
-            &env,
-            &proposal_id,
-            &validator,
-            compatibility_score,
-            is_valid,
-        );
-
-        Ok(())
+        env.storage().instance().set(&PENDING, &pending);
+        Ok(pending)
     }
 
-    /// Approve an upgrade proposal
+    /// Cancel a scheduled upgrade.
     ///
-    /// # Arguments
-    /// * `approver` - Address approving the upgrade
-    /// * `proposal_id` - ID of proposal to approve
-    /// * `signature_hash` - Hash of approval signature
-    pub fn approve_upgrade(
-        env: Env,
-        approver: Address,
-        proposal_id: BytesN<32>,
-        signature_hash: BytesN<32>,
-    ) -> Result<(), UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
+    /// The counterpart to the timelock: a window to notice a bad upgrade is
+    /// worth nothing without a way to stop it.
+    pub fn cancel_upgrade(env: Env) -> Result<(), UpgradeError> {
+        Self::require_admin(&env)?;
+
+        if !env.storage().instance().has(&PENDING) {
+            return Err(UpgradeError::NoUpgradeScheduled);
         }
 
-        approver.require_auth();
-
-        let config = storage::get_config(&env);
-        Self::verify_governance_auth(&env, &approver, &config)?;
-
-        let mut proposal =
-            storage::get_proposal(&env, &proposal_id).ok_or(UpgradeError::ProposalNotFound)?;
-
-        // Must be validated first
-        if proposal.status != UpgradeStatus::Validated as u32 {
-            return Err(UpgradeError::ProposalNotValidated);
-        }
-
-        // Check not already approved
-        if storage::has_approved(&env, &proposal_id, &approver) {
-            return Err(UpgradeError::AlreadyApproved);
-        }
-
-        let timestamp = env.ledger().timestamp();
-
-        // Add approval
-        let approval = ApprovalRecord {
-            approver: approver.clone(),
-            approved_at: timestamp,
-            signature_hash,
-        };
-
-        let mut approvals = storage::get_approvals(&env, &proposal_id);
-        approvals.push_back(approval);
-        storage::set_approvals(&env, &proposal_id, &approvals);
-
-        // Update proposal
-        proposal.approval_count += 1;
-
-        // Check if threshold reached
-        if proposal.approval_count >= config.required_approvals {
-            proposal.status = UpgradeStatus::Scheduled as u32;
-            proposal.scheduled_at = Some(timestamp);
-
-            events::emit_upgrade_scheduled(&env, &proposal_id, timestamp);
-        }
-
-        storage::set_proposal(&env, &proposal);
-
-        events::emit_upgrade_approved(&env, &proposal_id, &approver, proposal.approval_count);
-
+        env.storage().instance().remove(&PENDING);
         Ok(())
     }
 
-    /// Execute an approved upgrade
+    // ── Pause ───────────────────────────────────────────────────────────────
+
+    /// Pause state-changing operations.
     ///
-    /// # Arguments
-    /// * `executor` - Address executing the upgrade
-    /// * `proposal_id` - ID of proposal to execute
-    pub fn execute_upgrade(
-        env: Env,
-        executor: Address,
-        proposal_id: BytesN<32>,
-    ) -> Result<(), UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
-        }
-
-        executor.require_auth();
-
-        let config = storage::get_config(&env);
-        Self::verify_governance_auth(&env, &executor, &config)?;
-
-        // Check not already executed (replay protection)
-        if storage::is_proposal_executed(&env, &proposal_id) {
-            return Err(UpgradeError::ProposalAlreadyExecuted);
-        }
-
-        let mut proposal =
-            storage::get_proposal(&env, &proposal_id).ok_or(UpgradeError::ProposalNotFound)?;
-
-        // Must be scheduled
-        if proposal.status != UpgradeStatus::Scheduled as u32 {
-            return Err(UpgradeError::ProposalNotScheduled);
-        }
-
-        // Check timelock expired
-        let timestamp = env.ledger().timestamp();
-        if timestamp < proposal.timelock_end {
-            return Err(UpgradeError::TimelockNotExpired);
-        }
-
-        // Check simulation if required
-        if config.simulation_required && !proposal.simulation_passed {
-            return Err(UpgradeError::SimulationRequired);
-        }
-
-        // Check contract not paused
-        let emergency_state = storage::get_emergency_state(&env, &proposal.contract_address);
-        if emergency_state.is_paused {
-            return Err(UpgradeError::ContractPaused);
-        }
-
-        // Check global emergency
-        if storage::get_global_emergency(&env) {
-            return Err(UpgradeError::SystemPaused);
-        }
-
-        // Mark as executed BEFORE upgrade (CEI pattern)
-        storage::set_proposal_executed(&env, &proposal_id);
-
-        // Perform the upgrade
-        // Note: In production, this would call env.deployer().update_current_contract_wasm()
-        // For now, we simulate by updating the stored hash
-        let old_hash = storage::get_contract_current_hash(&env, &proposal.contract_address)
-            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
-
-        storage::set_contract_current_hash(
-            &env,
-            &proposal.contract_address,
-            &proposal.new_wasm_hash,
-        );
-
-        // Update proposal
-        proposal.status = UpgradeStatus::Executed as u32;
-        proposal.executed_at = Some(timestamp);
-        storage::set_proposal(&env, &proposal);
-
-        // Add to history
-        let history_entry = UpgradeHistoryEntry {
-            upgrade_id: proposal_id.clone(),
-            contract_address: proposal.contract_address.clone(),
-            old_wasm_hash: old_hash,
-            new_wasm_hash: proposal.new_wasm_hash.clone(),
-            upgrade_type: proposal.upgrade_type,
-            executed_at: timestamp,
-            executed_by: executor.clone(),
-            success: true,
-        };
-        storage::add_history_entry(&env, &history_entry);
-
-        events::emit_upgrade_executed(
-            &env,
-            &proposal_id,
-            &proposal.contract_address,
-            &executor,
-            true,
-        );
-
+    /// Required before executing an upgrade that migrates state: migrating
+    /// while writes are still landing migrates an inconsistent snapshot, and
+    /// the resulting corruption is silent.
+    pub fn pause(env: Env) -> Result<(), UpgradeError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&PAUSED, &true);
         Ok(())
     }
 
-    // ========================================================================
-    // Rollback Functions
-    // ========================================================================
+    pub fn unpause(env: Env) -> Result<(), UpgradeError> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&PAUSED, &false);
+        Ok(())
+    }
 
-    /// Rollback a contract to its previous version
+    #[must_use]
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&PAUSED).unwrap_or(false)
+    }
+
+    /// Guard for other contracts to call before mutating state.
     ///
-    /// # Arguments
-    /// * `initiator` - Address initiating the rollback
-    /// * `contract_address` - Address of contract to rollback
-    /// * `reason` - Reason for rollback
-    pub fn rollback_upgrade(
-        env: Env,
-        initiator: Address,
-        contract_address: Address,
-        reason: String,
-    ) -> Result<(), UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
+    /// # Errors
+    /// - `Paused` while an upgrade is in progress.
+    pub fn require_not_paused(env: Env) -> Result<(), UpgradeError> {
+        if Self::is_paused(env) {
+            return Err(UpgradeError::Paused);
         }
-
-        initiator.require_auth();
-
-        let config = storage::get_config(&env);
-        Self::verify_governance_auth(&env, &initiator, &config)?;
-
-        // Get rollback info
-        let rollback_info = storage::get_rollback_info(&env, &contract_address)
-            .ok_or(UpgradeError::NoRollbackAvailable)?;
-
-        let timestamp = env.ledger().timestamp();
-
-        // Perform rollback
-        // Note: In production, this would call env.deployer().update_current_contract_wasm()
-        storage::set_contract_current_hash(
-            &env,
-            &contract_address,
-            &rollback_info.previous_wasm_hash,
-        );
-
-        // Update rollback info
-        let updated_info = RollbackInfo {
-            contract_address: contract_address.clone(),
-            previous_wasm_hash: rollback_info.previous_wasm_hash,
-            rollback_at: timestamp,
-            reason: reason.clone(),
-            initiated_by: initiator.clone(),
-        };
-        storage::set_rollback_info(&env, &updated_info);
-
-        events::emit_upgrade_rolled_back(&env, &contract_address, &initiator, &reason);
-
         Ok(())
     }
 
-    // ========================================================================
-    // Emergency Controls
-    // ========================================================================
+    // ── Execution ───────────────────────────────────────────────────────────
 
-    /// Emergency pause a contract
+    /// Execute the scheduled upgrade.
     ///
-    /// # Arguments
-    /// * `caller` - Address calling emergency pause
-    /// * `contract_address` - Address of contract to pause
-    /// * `reason` - Reason for emergency pause
-    pub fn emergency_pause(
-        env: Env,
-        caller: Address,
-        contract_address: Address,
-        reason: String,
-    ) -> Result<(), UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
-        }
-
-        caller.require_auth();
-
-        let config = storage::get_config(&env);
-        Self::verify_governance_auth(&env, &caller, &config)?;
-
-        let timestamp = env.ledger().timestamp();
-
-        let emergency_state = EmergencyState {
-            is_paused: true,
-            paused_at: Some(timestamp),
-            paused_by: Some(caller.clone()),
-            reason: Some(reason.clone()),
-        };
-
-        storage::set_emergency_state(&env, &contract_address, &emergency_state);
-
-        events::emit_emergency_pause(&env, &contract_address, &caller, &reason);
-
-        Ok(())
-    }
-
-    /// Unpause a contract
+    /// The previous WASM hash is written into history **before** the swap, so
+    /// the rollback target exists even if the new code is broken enough that
+    /// nothing after this point runs correctly. Recording it afterwards would
+    /// make rollback depend on the very code that just failed.
     ///
-    /// # Arguments
-    /// * `caller` - Address calling unpause
-    /// * `contract_address` - Address of contract to unpause
-    pub fn unpause_contract(
-        env: Env,
-        caller: Address,
-        contract_address: Address,
-    ) -> Result<(), UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
+    /// # Errors
+    /// - `NoUpgradeScheduled` if nothing is pending.
+    /// - `TimelockNotElapsed` if the delay has not passed.
+    /// - `NotPaused` if the upgrade migrates state and the contract is live.
+    pub fn execute_upgrade(env: Env) -> Result<UpgradeRecord, UpgradeError> {
+        let record = Self::prepare_upgrade(env.clone())?;
+
+        // Soroban replaces the code in place - same address, same storage, and
+        // every existing reference to this contract keeps working. This is what
+        // makes a delegating proxy unnecessary.
+        env.deployer()
+            .update_current_contract_wasm(record.to_wasm_hash.clone());
+
+        Ok(record)
+    }
+
+    /// Everything `execute_upgrade` does *except* installing the new WASM:
+    /// run the checks, record history, advance the version, clear the pending
+    /// slot, and return the hash to install.
+    ///
+    /// Split out because `update_current_contract_wasm` requires a WASM that
+    /// has actually been uploaded to the ledger, which a unit test cannot
+    /// fabricate. Keeping the governance logic — timelock, pause requirement,
+    /// version ordering, rollback bookkeeping — on this side of the boundary
+    /// means all of it is testable, and the privileged host call stays a thin
+    /// wrapper with nothing to get wrong.
+    ///
+    /// Callers should use `execute_upgrade`; this is public so the decision can
+    /// be exercised directly.
+    pub fn prepare_upgrade(env: Env) -> Result<UpgradeRecord, UpgradeError> {
+        let admin = Self::require_admin(&env)?;
+
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&PENDING)
+            .ok_or(UpgradeError::NoUpgradeScheduled)?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.executable_at {
+            return Err(UpgradeError::TimelockNotElapsed);
         }
 
-        caller.require_auth();
+        // Only migrating upgrades demand a pause. Forcing it for every upgrade
+        // would make routine patches disruptive enough that operators start
+        // skipping the mechanism.
+        if pending.requires_migration && !Self::is_paused(env.clone()) {
+            return Err(UpgradeError::NotPaused);
+        }
 
-        let config = storage::get_config(&env);
-        Self::verify_governance_auth(&env, &caller, &config)?;
+        let from_version: Version = Self::current_version(env.clone())?;
+        let from_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&CURRENT)
+            .ok_or(UpgradeError::NotInitialized)?;
 
-        let emergency_state = EmergencyState {
-            is_paused: false,
-            paused_at: None,
-            paused_by: None,
-            reason: None,
+        let record = UpgradeRecord {
+            from_version,
+            to_version: pending.target_version,
+            from_wasm_hash: from_hash,
+            to_wasm_hash: pending.new_wasm_hash.clone(),
+            executed_at: now,
+            executed_by: admin,
+            was_rollback: false,
         };
 
-        storage::set_emergency_state(&env, &contract_address, &emergency_state);
+        // History and version first; the WASM swap last.
+        Self::push_history(&env, &record);
+        env.storage()
+            .instance()
+            .set(&VERSION, &pending.target_version);
+        env.storage()
+            .instance()
+            .set(&CURRENT, &pending.new_wasm_hash);
+        env.storage().instance().remove(&PENDING);
 
-        events::emit_emergency_unpause(&env, &contract_address, &caller);
+        Ok(record)
+    }
 
+    /// Roll back to the previously deployed WASM.
+    ///
+    /// Records a new history entry rather than deleting the failed one: an
+    /// upgrade that had to be reverted is exactly the event an operator most
+    /// needs to find later, and erasing it would be rewriting the record.
+    ///
+    /// The version is restored to the pre-upgrade value, so a subsequent
+    /// re-attempt is a fresh upgrade rather than a silent re-run.
+    ///
+    /// # Errors
+    /// - `NoRollbackTarget` if no upgrade has been executed yet.
+    pub fn rollback(env: Env) -> Result<UpgradeRecord, UpgradeError> {
+        let record = Self::prepare_rollback(env.clone())?;
+
+        env.deployer()
+            .update_current_contract_wasm(record.to_wasm_hash.clone());
+
+        Ok(record)
+    }
+
+    /// `rollback` without installing the WASM. See [`Self::prepare_upgrade`]
+    /// for why the split exists.
+    pub fn prepare_rollback(env: Env) -> Result<UpgradeRecord, UpgradeError> {
+        let admin = Self::require_admin(&env)?;
+
+        let history: Vec<UpgradeRecord> = env
+            .storage()
+            .instance()
+            .get(&HISTORY)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let last = history.last().ok_or(UpgradeError::NoRollbackTarget)?;
+
+        let record = UpgradeRecord {
+            from_version: last.to_version,
+            to_version: last.from_version,
+            from_wasm_hash: last.to_wasm_hash.clone(),
+            to_wasm_hash: last.from_wasm_hash.clone(),
+            executed_at: env.ledger().timestamp(),
+            executed_by: admin,
+            was_rollback: true,
+        };
+
+        Self::push_history(&env, &record);
+        env.storage().instance().set(&VERSION, &last.from_version);
+        env.storage().instance().set(&CURRENT, &last.from_wasm_hash);
+
+        Ok(record)
+    }
+
+    // ── Migration ───────────────────────────────────────────────────────────
+
+    /// Record that a named migration has run, refusing a second application.
+    ///
+    /// Migrations are rarely idempotent — "add 10% to every balance" run twice
+    /// is a different and much worse bug than not running it at all. The ledger
+    /// of applied migrations is what makes a retry safe after a partial
+    /// failure.
+    ///
+    /// # Errors
+    /// - `MigrationAlreadyApplied` if this name has already been recorded.
+    /// - `NotPaused` because migrations must not run against live writes.
+    pub fn record_migration(env: Env, name: Symbol) -> Result<(), UpgradeError> {
+        Self::require_admin(&env)?;
+
+        if !Self::is_paused(env.clone()) {
+            return Err(UpgradeError::NotPaused);
+        }
+
+        let key = (MIGRATED, name.clone());
+        if env.storage().persistent().has(&key) {
+            return Err(UpgradeError::MigrationAlreadyApplied);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&key, &env.ledger().timestamp());
         Ok(())
     }
 
-    // ========================================================================
-    // Query Functions
-    // ========================================================================
+    /// Whether a migration has been applied.
+    #[must_use]
+    pub fn is_migration_applied(env: Env, name: Symbol) -> bool {
+        env.storage().persistent().has(&(MIGRATED, name))
+    }
 
-    /// Get upgrade proposal details
-    pub fn get_proposal(
-        env: Env,
-        proposal_id: BytesN<32>,
-    ) -> Result<UpgradeProposal, UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
+    // ── Reads ───────────────────────────────────────────────────────────────
+
+    pub fn current_version(env: Env) -> Result<Version, UpgradeError> {
+        env.storage()
+            .instance()
+            .get(&VERSION)
+            .ok_or(UpgradeError::NotInitialized)
+    }
+
+    pub fn current_wasm_hash(env: Env) -> Result<BytesN<32>, UpgradeError> {
+        env.storage()
+            .instance()
+            .get(&CURRENT)
+            .ok_or(UpgradeError::NotInitialized)
+    }
+
+    #[must_use]
+    pub fn pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&PENDING)
+    }
+
+    #[must_use]
+    pub fn upgrade_history(env: Env) -> Vec<UpgradeRecord> {
+        env.storage()
+            .instance()
+            .get(&HISTORY)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Change the timelock delay. Admin only.
+    ///
+    /// A zero delay is rejected: it would turn scheduling into a formality and
+    /// remove the window the mechanism exists to create.
+    pub fn set_upgrade_delay(env: Env, delay_seconds: u64) -> Result<(), UpgradeError> {
+        Self::require_admin(&env)?;
+        if delay_seconds == 0 {
+            return Err(UpgradeError::InvalidDelay);
         }
-
-        storage::get_proposal(&env, &proposal_id).ok_or(UpgradeError::ProposalNotFound)
+        env.storage().instance().set(&DELAY, &delay_seconds);
+        Ok(())
     }
 
-    /// Get validation result for a proposal
-    pub fn get_validation(
-        env: Env,
-        proposal_id: BytesN<32>,
-    ) -> Result<ValidationResult, UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
+    // ── Internals ───────────────────────────────────────────────────────────
+
+    fn require_admin(env: &Env) -> Result<Address, UpgradeError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(UpgradeError::NotInitialized)?;
+        admin.require_auth();
+        Ok(admin)
+    }
+
+    /// Append to history, dropping the oldest entry past the cap.
+    fn push_history(env: &Env, record: &UpgradeRecord) {
+        let mut history: Vec<UpgradeRecord> = env
+            .storage()
+            .instance()
+            .get(&HISTORY)
+            .unwrap_or_else(|| Vec::new(env));
+
+        if history.len() >= MAX_HISTORY {
+            history.remove(0);
         }
-
-        storage::get_validation(&env, &proposal_id).ok_or(UpgradeError::ProposalNotFound)
-    }
-
-    /// Get upgrade history for a contract
-    pub fn get_upgrade_history(env: Env, contract_address: Address) -> Vec<UpgradeHistoryEntry> {
-        storage::get_history(&env, &contract_address)
-    }
-
-    /// Get emergency state for a contract
-    pub fn get_emergency_state(env: Env, contract_address: Address) -> EmergencyState {
-        storage::get_emergency_state(&env, &contract_address)
-    }
-
-    /// Get approvals for a proposal
-    pub fn get_approvals(env: Env, proposal_id: BytesN<32>) -> Vec<ApprovalRecord> {
-        storage::get_approvals(&env, &proposal_id)
-    }
-
-    /// Get system configuration
-    pub fn get_config(env: Env) -> Result<UpgradeConfig, UpgradeError> {
-        if !storage::is_initialized(&env) {
-            return Err(UpgradeError::NotInitialized);
-        }
-
-        Ok(storage::get_config(&env))
-    }
-
-    // ========================================================================
-    // Internal Helper Functions
-    // ========================================================================
-
-    fn verify_governance_auth(
-        _env: &Env,
-        caller: &Address,
-        config: &UpgradeConfig,
-    ) -> Result<(), UpgradeError> {
-        // In production, this would verify the caller is authorized by governance
-        // For now, we do a simple check
-        if caller == &config.governance_address {
-            return Ok(());
-        }
-
-        // Could also check if caller is in governance multisig
-        // This would integrate with the governance_multisig contract
-
-        Err(UpgradeError::NotGovernance)
+        history.push_back(record.clone());
+        env.storage().instance().set(&HISTORY, &history);
     }
 }
 

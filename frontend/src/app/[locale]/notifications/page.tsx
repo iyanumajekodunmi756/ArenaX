@@ -1,0 +1,226 @@
+"use client";
+
+import React, { useState } from "react";
+import { Bell, CheckCheck, Trash2, Settings, BellOff } from "lucide-react";
+import Link from "next/link";
+import { useNotifications } from "@/contexts/NotificationContext";
+import { EmptyState } from "@/components/common/EmptyState";
+import { Button } from "@/components/ui/Button";
+import { PersistentNotification } from "@/types/notification";
+import { cn } from "@/lib/utils";
+
+function formatTime(iso: string) {
+  const date = new Date(iso);
+  const now = new Date();
+  const diff = now.getTime() - date.getTime();
+  if (diff < 60_000) return "Just now";
+  if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h ago`;
+  return date.toLocaleDateString();
+}
+
+function NotificationItem({
+  notification,
+}: {
+  notification: PersistentNotification;
+}) {
+  const { markAsRead, removeNotification } = useNotifications();
+  const isRead = notification.read;
+
+  const handleMarkRead = () => {
+    if (!isRead) markAsRead(notification.id);
+  };
+
+  const handleDelete = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    removeNotification(notification.id);
+  };
+
+  // Inner content — the readable part of the notification
+  const innerContent = (
+    <div className="flex flex-col gap-1 pr-10">
+      <div className="flex items-start justify-between gap-2">
+        <p className={cn("font-medium text-sm", !isRead && "font-semibold")}>
+          {notification.title}
+        </p>
+        <span className="text-xs text-muted-foreground shrink-0">
+          {formatTime(notification.createdAt)}
+        </span>
+      </div>
+      {notification.message && (
+        <p className="text-sm text-muted-foreground line-clamp-3">
+          {notification.message}
+        </p>
+      )}
+      {notification.link && (
+        <span className="text-xs text-primary font-medium">
+          {notification.linkLabel ?? "View"}
+        </span>
+      )}
+    </div>
+  );
+
+  // Delete button — always rendered outside any <a> to avoid nested interactives.
+  // On pointer-fine devices (mouse) it fades in on hover; on touch devices it is
+  // always visible so users don't have to hover to find it.
+  const deleteButton = (
+    <Button
+      variant="ghost"
+      size="sm"
+      className={cn(
+        "absolute top-2 right-2 h-8 w-8 p-0 transition-opacity",
+        // Always visible on coarse-pointer (touch) devices; fade in on hover for mouse
+        "opacity-100 @pointer-coarse:opacity-100",
+        "sm:opacity-0 sm:group-hover:opacity-100",
+      )}
+      onClick={handleDelete}
+      aria-label="Remove notification"
+    >
+      <Trash2 className="h-4 w-4" />
+    </Button>
+  );
+
+  return (
+    <div className="group relative border-b border-border/50 last:border-0">
+      {notification.link ? (
+        // Link wraps only the readable content — delete button is a sibling
+        <>
+          <Link
+            href={notification.link}
+            className={cn(
+              "block p-4 rounded-lg transition-colors",
+              !isRead && "bg-primary/5",
+            )}
+            onClick={handleMarkRead}
+          >
+            {innerContent}
+          </Link>
+          {deleteButton}
+        </>
+      ) : (
+        // No link — whole row is a div button, delete button still sits outside
+        // interactive content via absolute positioning
+        <>
+          <button
+            type="button"
+            className={cn(
+              "w-full text-left p-4 rounded-lg transition-colors cursor-pointer",
+              !isRead && "bg-primary/5",
+            )}
+            onClick={handleMarkRead}
+          >
+            {innerContent}
+          </button>
+          {deleteButton}
+        </>
+      )}
+    </div>
+  );
+}
+
+const PAGE_SIZE = 20;
+
+export default function NotificationsPage() {
+  const {
+    persistentNotifications,
+    unreadCount,
+    markAllAsRead,
+    hasMoreNotifications,
+    loadMoreNotifications,
+  } = useNotifications();
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+
+  const visibleNotifications = persistentNotifications.slice(0, visibleCount);
+  const canLoadMore =
+    visibleCount < persistentNotifications.length || hasMoreNotifications;
+
+  const handleLoadMore = async () => {
+    if (visibleCount < persistentNotifications.length) {
+      setVisibleCount((prev) => prev + PAGE_SIZE);
+      return;
+    }
+    setIsLoadingMore(true);
+    try {
+      await loadMoreNotifications();
+      setVisibleCount((prev) => prev + PAGE_SIZE);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen">
+      <div className="container mx-auto px-4 py-8">
+        {/* Header */}
+        <div className="mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold mb-2 flex items-center gap-2">
+              <Bell className="w-7 h-7" />
+              Notifications
+            </h1>
+            <p className="text-muted-foreground">
+              {unreadCount > 0
+                ? `You have ${unreadCount} unread notification${unreadCount > 1 ? "s" : ""}`
+                : "You're all caught up!"}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {unreadCount > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-2"
+                onClick={markAllAsRead}
+              >
+                <CheckCheck className="h-4 w-4" />
+                Mark all read
+              </Button>
+            )}
+            <Link href="/notifications/settings">
+              <Button variant="ghost" size="sm" className="gap-2">
+                <Settings className="h-4 w-4" />
+                Settings
+              </Button>
+            </Link>
+          </div>
+        </div>
+
+        {/* Notifications List */}
+        <div className="bg-card rounded-lg border shadow-sm">
+          {persistentNotifications.length === 0 ? (
+            <div className="p-12">
+              <EmptyState
+                icon={BellOff}
+                title="No notifications yet"
+                description="You're all caught up! We'll notify you when there's something new."
+              />
+            </div>
+          ) : (
+            <div className="divide-y divide-border/50">
+              {visibleNotifications.map((n) => (
+                <NotificationItem
+                  key={n.id}
+                  notification={n}
+                />
+              ))}
+            </div>
+          )}
+          {canLoadMore && (
+            <div className="flex justify-center p-4 border-t border-border/50">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleLoadMore}
+                disabled={isLoadingMore}
+              >
+                {isLoadingMore ? "Loading..." : "Load more"}
+              </Button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

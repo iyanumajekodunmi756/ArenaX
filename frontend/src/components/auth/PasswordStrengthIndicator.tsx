@@ -27,15 +27,18 @@ export function calculateStrength(password: string): StrengthLevel | null {
   return 'Strong';
 }
 
-const LEVEL_CONFIG: Record<StrengthLevel, { bars: number; color: string; label: string }> = {
-  Weak:   { bars: 1, color: 'bg-red-500',    label: 'text-red-500'    },
-  Medium: { bars: 2, color: 'bg-yellow-500', label: 'text-yellow-500' },
-  Strong: { bars: 3, color: 'bg-green-500',  label: 'text-green-500'  },
-};
-
 interface PasswordStrengthIndicatorProps {
   password: string;
 }
+
+const LEVEL_CONFIG: Record<
+  StrengthLevel,
+  { bars: number; color: string; label: string }
+> = {
+  Weak: { bars: 1, color: 'bg-destructive', label: 'text-destructive' },
+  Medium: { bars: 2, color: 'bg-orange-500', label: 'text-orange-500' },
+  Strong: { bars: 3, color: 'bg-success', label: 'text-success' },
+};
 
 export function PasswordStrengthIndicator({ password }: PasswordStrengthIndicatorProps) {
   const level = calculateStrength(password);

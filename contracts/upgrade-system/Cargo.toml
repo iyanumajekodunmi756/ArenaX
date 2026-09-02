@@ -5,17 +5,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ArenaX Secure Contract Upgrade System with Governance Control"
+description = "ArenaX contract upgrade manager: versioning, staged migration, pause and rollback"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk.workspace = true
-arenax-events = { path = "../arenax-events" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-
-[features]
-testutils = ["soroban-sdk/testutils"]

@@ -38,58 +38,78 @@ export default function MatchmakingQueue({ gameMode, onCancel, onMatchFound }: M
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const progressPercent = Math.min((waitTime / estimatedTime) * 100, 100);
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900 flex items-center justify-center">
-      <div className="bg-white/10 backdrop-blur-lg rounded-2xl p-12 border border-white/20 max-w-md w-full mx-4">
+    <div className="min-h-screen bg-gradient-hero flex items-center justify-center">
+      <div className="bg-card/60 backdrop-blur-lg rounded-2xl p-12 border border-border max-w-md w-full mx-4">
         <div className="text-center">
-          <div className="relative mb-8">
-            <div className="w-32 h-32 mx-auto rounded-full border-4 border-purple-500 border-t-transparent animate-spin" />
+          <div className="relative mb-8" aria-hidden="true">
+            <div className="w-32 h-32 mx-auto rounded-full border-4 border-primary border-t-transparent animate-spin" />
             <div className="absolute inset-0 flex items-center justify-center">
               <span className="text-4xl">🎮</span>
             </div>
           </div>
 
-          <h2 className="text-3xl font-bold text-white mb-4">
+          <h2 className="text-3xl font-bold text-foreground mb-4">
             Finding Opponents...
           </h2>
-          
-          <p className="text-gray-300 mb-6">
-            Game Mode: <span className="text-purple-400 font-semibold">{gameMode}</span>
+
+          <p className="text-foreground/80 mb-6">
+            Game Mode: <span className="text-primary font-semibold">{gameMode}</span>
           </p>
 
-          <div className="bg-gray-800/50 rounded-xl p-6 mb-6">
-            <div className="text-5xl font-mono font-bold text-white mb-2">
+          <div className="bg-muted/50 rounded-xl p-6 mb-6">
+            <div className="text-5xl font-mono font-bold text-foreground mb-2">
               {formatTime(waitTime)}
             </div>
-            <p className="text-gray-400 text-sm">Wait Time</p>
+            <p className="text-muted-foreground text-sm">Wait Time</p>
           </div>
 
           <div className="grid grid-cols-2 gap-4 mb-8">
-            <div className="bg-gray-800/50 rounded-lg p-4">
-              <div className="text-2xl font-bold text-purple-400">{playerCount}</div>
-              <div className="text-gray-400 text-xs">Players Found</div>
+            <div className="bg-muted/50 rounded-lg p-4">
+              <div className="text-2xl font-bold text-primary">{playerCount}</div>
+              <div className="text-muted-foreground text-xs">Players Found</div>
             </div>
-            <div className="bg-gray-800/50 rounded-lg p-4">
-              <div className="text-2xl font-bold text-green-400">~{estimatedTime - waitTime}s</div>
-              <div className="text-gray-400 text-xs">Estimated</div>
+            <div className="bg-muted/50 rounded-lg p-4">
+              {waitTime >= estimatedTime ? (
+                <div className="text-2xl font-bold text-success/80">Almost there...</div>
+              ) : (
+                <div className="text-2xl font-bold text-success/80">~{Math.max(0, estimatedTime - waitTime)}s</div>
+              )}
+              <div className="text-muted-foreground text-xs">Estimated</div>
             </div>
           </div>
 
           <div className="space-y-3">
-            <div className="w-full bg-gray-700 rounded-full h-2">
-              <div 
-                className="bg-gradient-to-r from-purple-500 to-pink-500 h-2 rounded-full transition-all duration-1000"
+            <div
+              className="w-full bg-muted rounded-full h-2"
+              role="progressbar"
+              aria-label="Matchmaking progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={progressPercent}
+            >
+              <div
+                className="bg-primary h-2 rounded-full transition-all duration-1000"
                 style={{ width: `${Math.min((waitTime / estimatedTime) * 100, 100)}%` }}
               />
             </div>
-            
+
             <button
+              type="button"
               onClick={onCancel}
-              className="w-full px-6 py-3 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg transition-colors duration-200 border border-red-500/30"
+              className="w-full px-6 py-3 bg-destructive/20 hover:bg-destructive/30 text-destructive rounded-lg transition-colors duration-200 border border-destructive/30"
             >
               Cancel Matchmaking
             </button>
           </div>
+
+          <p role="status" aria-live="polite" className="sr-only">
+            {isSearching
+              ? `Searching for opponents in ${gameMode} mode`
+              : 'Match found'}
+          </p>
         </div>
       </div>
     </div>

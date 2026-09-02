@@ -89,6 +89,37 @@ const cacheMissesTotal = getOrCreateCounter({
   labelNames: ['namespace'],
 });
 
+// Redis Cluster metrics (#655)
+const redisClusterNodesTotal = getOrCreateGauge({
+  name: 'redis_cluster_nodes_total',
+  help: 'Number of nodes configured in the Redis Cluster',
+});
+
+const redisClusterNodesReady = getOrCreateGauge({
+  name: 'redis_cluster_nodes_ready',
+  help: 'Number of Redis Cluster nodes currently reachable and ready',
+});
+
+// Compression metrics (issue #477)
+const compressionUncompressedBytes = getOrCreateCounter({
+  name: 'http_response_uncompressed_bytes_total',
+  help: 'Total number of uncompressed response bytes (what the app would have sent)',
+  labelNames: ['encoding'],
+});
+
+const compressionCompressedBytes = getOrCreateCounter({
+  name: 'http_response_compressed_bytes_total',
+  help: 'Total number of compressed (wire) response bytes',
+  labelNames: ['encoding'],
+});
+
+const compressionRatio = getOrCreateHistogram({
+  name: 'http_response_compression_ratio',
+  help: 'Distribution of per-response compression ratios (compressed/uncompressed)',
+  labelNames: ['encoding'],
+  buckets: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+});
+
 export class MetricsService {
   private static instance: MetricsService;
 
@@ -133,6 +164,22 @@ export class MetricsService {
     cacheMissesTotal.inc({ namespace });
   }
 
+  // Redis Cluster metrics (#655)
+  setRedisClusterHealth(nodesTotal: number, nodesReady: number) {
+    redisClusterNodesTotal.set(nodesTotal);
+    redisClusterNodesReady.set(nodesReady);
+  }
+
+  // Compression metrics (issue #477)
+  recordCompression(
+    encoding: string,
+    payload: { uncompressedBytes: number; compressedBytes: number; ratio: number },
+  ) {
+    compressionUncompressedBytes.inc({ encoding }, payload.uncompressedBytes);
+    compressionCompressedBytes.inc({ encoding }, payload.compressedBytes);
+    compressionRatio.observe({ encoding }, payload.ratio);
+  }
+
   // Connection metrics
   setActiveConnections(count: number) {
     activeConnections.set(count);
@@ -163,6 +210,8 @@ export class MetricsService {
     responseSizeBytes.reset();
     cacheHitsTotal.reset();
     cacheMissesTotal.reset();
+    redisClusterNodesTotal.reset();
+    redisClusterNodesReady.reset();
     logger.info('Metrics reset');
   }
 

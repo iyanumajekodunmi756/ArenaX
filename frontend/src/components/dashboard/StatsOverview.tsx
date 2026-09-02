@@ -1,7 +1,8 @@
 "use client";
 
 import { Card, CardContent } from "@/components/ui/Card";
-import { TrendingUp, TrendingDown, Trophy, Swords, Target, Zap } from "lucide-react";
+import { TrendingUp, TrendingDown, Trophy, Swords, Target, Zap, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/Button";
 
 interface Stat {
   label: string;
@@ -18,9 +19,73 @@ interface StatsOverviewProps {
   winRate: number;
   rank: number;
   streak: number;
+  isLoading?: boolean;
+  isError?: boolean;
+  onRetry?: () => void;
 }
 
-export function StatsOverview({ elo, wins, losses, winRate, rank, streak }: StatsOverviewProps) {
+function StatSkeleton() {
+  return (
+    <Card>
+      <CardContent className="p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div className="h-3 w-20 bg-muted rounded animate-pulse" />
+          <div className="h-5 w-5 bg-muted rounded animate-pulse" />
+        </div>
+        <div className="h-8 w-24 bg-muted rounded animate-pulse mt-1" />
+        <div className="h-3 w-28 bg-muted rounded animate-pulse mt-2" />
+      </CardContent>
+    </Card>
+  );
+}
+
+function StatsErrorFallback({ onRetry }: { onRetry?: () => void }) {
+  return (
+    <div className="col-span-2 lg:col-span-4">
+      <Card>
+        <CardContent className="p-5 flex flex-col items-center justify-center gap-3 text-center">
+          <p className="text-sm text-muted-foreground">Could not load stats — please try again.</p>
+          {onRetry && (
+            <Button variant="outline" size="sm" onClick={onRetry} className="gap-2">
+              <RefreshCw className="h-4 w-4" />
+              Retry
+            </Button>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+export function StatsOverview({
+  elo,
+  wins,
+  losses,
+  winRate,
+  rank,
+  streak,
+  isLoading = false,
+  isError = false,
+  onRetry,
+}: StatsOverviewProps) {
+  if (isLoading) {
+    return (
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <StatSkeleton key={i} />
+        ))}
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatsErrorFallback onRetry={onRetry} />
+      </div>
+    );
+  }
+
   const stats: Stat[] = [
     {
       label: "ELO Rating",
@@ -40,13 +105,13 @@ export function StatsOverview({ elo, wins, losses, winRate, rank, streak }: Stat
       value: `${winRate}%`,
       change: 2.5,
       icon: <Target className="h-5 w-5" />,
-      accent: "text-green-500",
+      accent: "text-success",
     },
     {
       label: "W / L",
       value: `${wins} / ${losses}`,
       icon: <Swords className="h-5 w-5" />,
-      accent: "text-blue-500",
+      accent: "text-primary",
     },
   ];
 
@@ -63,7 +128,7 @@ export function StatsOverview({ elo, wins, losses, winRate, rank, streak }: Stat
             </div>
             <p className="text-2xl font-black tracking-tight">{stat.value}</p>
             {stat.change !== undefined && (
-              <p className={`text-xs mt-1 flex items-center gap-1 ${stat.change >= 0 ? "text-green-500" : "text-red-500"}`}>
+              <p className={`text-xs mt-1 flex items-center gap-1 ${stat.change >= 0 ? "text-success" : "text-destructive"}`}>
                 {stat.change >= 0 ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
                 {stat.change >= 0 ? "+" : ""}{stat.change} this week
               </p>

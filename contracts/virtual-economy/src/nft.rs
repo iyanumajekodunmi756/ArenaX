@@ -1,4 +1,9 @@
 // NFT management utilities
+//
+// A reusable calculation library not yet wired into the contract's public
+// entry points in lib.rs.
+#![allow(dead_code)]
+
 use crate::error::VirtualEconomyError;
 use crate::storage::*;
 use soroban_sdk::{Address, BytesN, Env, String, Vec};
@@ -8,7 +13,7 @@ pub struct NFTManager;
 impl NFTManager {
     /// Validate NFT metadata before minting
     pub fn validate_metadata(metadata: &NFTMetadata) -> Result<(), VirtualEconomyError> {
-        if metadata.name.len() == 0 || metadata.name.len() > 100 {
+        if metadata.name.is_empty() || metadata.name.len() > 100 {
             return Err(VirtualEconomyError::InvalidMetadata);
         }
 
@@ -20,23 +25,30 @@ impl NFTManager {
             return Err(VirtualEconomyError::InvalidMetadata);
         }
 
+        if metadata.royalty_bps > 2000 {
+            return Err(VirtualEconomyError::RoyaltyTooHigh);
+        }
+
         Ok(())
     }
 
     /// Calculate NFT rarity score based on attributes
-    pub fn calculate_rarity_score(metadata: &NFTMetadata) -> u32 {
+    pub fn calculate_rarity_score(env: &Env, metadata: &NFTMetadata) -> u32 {
         let mut score = metadata.rarity * 20; // Base score from rarity level
 
         // Add bonus for number of attributes
-        score += metadata.attributes.len() as u32 * 5;
+        score += metadata.attributes.len() * 5;
 
         // Add bonus for special categories
-        let category_str = metadata.category.to_string();
-        if category_str == "legendary" {
+        let legendary = String::from_str(env, "legendary");
+        let epic = String::from_str(env, "epic");
+        let rare = String::from_str(env, "rare");
+
+        if metadata.category == legendary {
             score += 50;
-        } else if category_str == "epic" {
+        } else if metadata.category == epic {
             score += 30;
-        } else if category_str == "rare" {
+        } else if metadata.category == rare {
             score += 15;
         }
 
@@ -44,7 +56,7 @@ impl NFTManager {
     }
 
     /// Generate collection statistics
-    pub fn get_collection_stats(env: &Env, collection_name: &String) -> CollectionStats {
+    pub fn get_collection_stats(_env: &Env, _collection_name: &String) -> CollectionStats {
         // This would iterate through all NFTs and calculate stats
         // For now, return placeholder
         CollectionStats {

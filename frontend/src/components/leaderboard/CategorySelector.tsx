@@ -2,7 +2,7 @@
 
 import React from 'react'
 
-type Category = 'global' | 'tournaments' | 'casual'
+type Category = 'global' | 'tournaments' | 'casual' | 'ranked'
 
 interface CategorySelectorProps {
   category: Category
@@ -25,6 +25,11 @@ const categories: { id: Category; label: string; description: string }[] = [
     label: 'Casual',
     description: 'Casual game rankings',
   },
+  {
+    id: 'ranked',
+    label: 'Ranked',
+    description: 'Ranked match rankings',
+  },
 ]
 
 export const CategorySelector: React.FC<CategorySelectorProps> = ({
@@ -32,8 +37,8 @@ export const CategorySelector: React.FC<CategorySelectorProps> = ({
   onChange,
 }) => {
   return (
-    <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700">
-      <h3 className="text-sm font-semibold text-gray-300 mb-3">Category</h3>
+    <div className="bg-surface/50 rounded-lg p-4 border border-border">
+      <h3 className="text-sm font-semibold text-foreground/80 mb-3">Category</h3>
       <div className="flex gap-2">
         {categories.map((cat) => (
           <button
@@ -41,8 +46,8 @@ export const CategorySelector: React.FC<CategorySelectorProps> = ({
             onClick={() => onChange(cat.id)}
             className={`flex-1 px-4 py-2 rounded-lg font-medium transition-colors ${
               category === cat.id
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                ? 'bg-primary/90 text-white'
+                : 'bg-surface-raised text-foreground/80 hover:bg-gray-600'
             }`}
             title={cat.description}
           >

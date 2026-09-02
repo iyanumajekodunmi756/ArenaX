@@ -1,7 +1,14 @@
 #![no_std]
 
+mod flexible_rewards;
+mod validator_penalty;
+
 use arenax_events::staking as events;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
+
+use flexible_rewards::{calc_pending as calc_flexible_pending, early_exit_penalty};
+pub use flexible_rewards::{FlexiblePosition, RewardPool};
+use validator_penalty::ValidatorPenaltyManager;
 
 // ─── Storage Keys ────────────────────────────────────────────────────────────
 
@@ -21,6 +28,24 @@ pub enum DataKey {
     RewardConfig,
     TotalRewardStaked,
     Paused,
+    // Flexible reward pools (multiple lock/APY tiers)
+    Pool(u32),
+    PoolCounter,
+    FlexiblePosition(Address, u32),
+    UserPools(Address),
+    // Validator penalty / slashing
+    /// Global slash configuration set by admin.
+    ValidatorSlashConfig,
+    /// Monotonically increasing counter used to generate unique slash IDs.
+    ValidatorPenaltyCounter,
+    /// Per-validator immutable slash history (persistent).
+    ValidatorSlashRecord(Address),
+    /// Individual slash record keyed by slash_id (persistent).
+    ValidatorAppealRecord(BytesN<32>),
+    /// Appeal submitted against a slash, keyed by slash_id (persistent).
+    ValidatorAppeal(BytesN<32>),
+    /// Running total of tokens removed from circulation via slash burns.
+    BurnedSupply,
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -106,6 +131,63 @@ pub struct RewardConfig {
     pub min_stake: i128,
     /// Seconds in a year (used for pro-rata calculation)
     pub secs_per_year: u64,
+}
+
+// ─── Validator Slashing Types ─────────────────────────────────────────────────
+
+/// Global configuration for the validator slash system.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashConfig {
+    /// Whether the slashing system is currently active.
+    pub enabled: bool,
+    /// Ordered list of slash amounts per severity level (index = severity 0-4).
+    pub slash_amounts: Vec<i128>,
+    /// Fraction of slashed tokens to burn (rest goes to reward pool).
+    /// Expressed in basis points (5000 = 50 %).
+    pub burn_bps: u32,
+    /// Seconds after a slash during which the validator may appeal.
+    pub appeal_window_seconds: u64,
+}
+
+/// Immutable record of a single slash event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashRecord {
+    pub slash_id: BytesN<32>,
+    pub validator: Address,
+    pub amount: i128,
+    pub severity: u32,
+    pub reason: u32,
+    pub slashed_at: u64,
+    pub burned_amount: i128,
+    pub pool_amount: i128,
+    pub appealed: bool,
+    pub appeal_resolved: bool,
+    pub appeal_granted: bool,
+}
+
+/// An appeal submitted by a slashed validator.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealRecord {
+    pub slash_id: BytesN<32>,
+    pub appellant: Address,
+    pub appeal_reason: u32,
+    pub submitted_at: u64,
+    pub resolved: bool,
+    pub granted: bool,
+}
+
+/// Aggregate slash history for a single validator.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatorSlashHistory {
+    pub validator: Address,
+    pub total_slashed: i128,
+    pub slash_count: u32,
+    /// `Some(slash_id)` when there is an open appeal pending resolution.
+    pub active_appeal: Option<BytesN<32>>,
 }
 
 // ─── Contract ────────────────────────────────────────────────────────────────
@@ -497,7 +579,7 @@ impl StakingManager {
         let ax_token = Self::get_ax_token(env.clone());
         token::Client::new(&env, &ax_token).transfer(
             &user,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &amount,
         );
 
@@ -657,9 +739,365 @@ impl StakingManager {
         events::emit_contract_paused(&env, paused, &env.current_contract_address());
     }
 
+    // ── Flexible Reward Pools ────────────────────────────────────────────────
+    //
+    // Multiple named pools, each with its own APY, lock duration, and
+    // early-exit penalty, on top of the single-rate reward staking above.
+    // All pools draw from and pay into the same AX token reserve tracked by
+    // `DataKey::RewardPool` (funded via `fund_reward_pool`).
+
+    /// Create a new reward pool. `lock_duration` of `0` creates a flexible
+    /// (no-lock) pool; a positive value creates a locked pool that pairs a
+    /// higher `apy_bps` with an `early_exit_penalty_bps` charged against
+    /// principal if withdrawn before the lock expires.
+    pub fn create_reward_pool(
+        env: Env,
+        apy_bps: u32,
+        lock_duration: u64,
+        early_exit_penalty_bps: u32,
+    ) -> u32 {
+        Self::require_admin(&env);
+        if apy_bps > 10_000 {
+            panic!("rate exceeds 100%");
+        }
+        if early_exit_penalty_bps > 10_000 {
+            panic!("penalty exceeds 100%");
+        }
+
+        let id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCounter)
+            .unwrap_or(0);
+
+        let pool = RewardPool {
+            id,
+            apy_bps,
+            lock_duration,
+            early_exit_penalty_bps,
+            active: true,
+            total_staked: 0,
+        };
+        env.storage().persistent().set(&DataKey::Pool(id), &pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolCounter, &(id + 1));
+
+        events::emit_reward_pool_created(&env, id, apy_bps, lock_duration);
+        id
+    }
+
+    /// Activate/deactivate a pool. Deactivating stops new stakes but does
+    /// not affect existing positions.
+    pub fn set_reward_pool_active(env: Env, pool_id: u32, active: bool) {
+        Self::require_admin(&env);
+        let mut pool = Self::get_reward_pool(env.clone(), pool_id);
+        pool.active = active;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &pool);
+        events::emit_reward_pool_updated(&env, pool_id, pool.apy_bps, active);
+    }
+
+    /// Update a pool's APY going forward. Already-accrued rewards are
+    /// unaffected since they are snapshotted on every stake/claim/unstake.
+    pub fn set_reward_pool_rate(env: Env, pool_id: u32, apy_bps: u32) {
+        Self::require_admin(&env);
+        if apy_bps > 10_000 {
+            panic!("rate exceeds 100%");
+        }
+        let mut pool = Self::get_reward_pool(env.clone(), pool_id);
+        pool.apy_bps = apy_bps;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &pool);
+        events::emit_reward_pool_updated(&env, pool_id, apy_bps, pool.active);
+    }
+
+    pub fn get_reward_pool(env: Env, pool_id: u32) -> RewardPool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Pool(pool_id))
+            .expect("pool not found")
+    }
+
+    pub fn pool_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PoolCounter)
+            .unwrap_or(0)
+    }
+
+    /// Stake AX tokens into a specific reward pool. Staking again into a
+    /// pool the user already has a position in tops up the position and
+    /// (for locked pools) restarts the lock clock from now.
+    pub fn stake_flexible(env: Env, user: Address, pool_id: u32, amount: i128) {
+        Self::require_not_paused(&env);
+        user.require_auth();
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        let mut pool = Self::get_reward_pool(env.clone(), pool_id);
+        if !pool.active {
+            panic!("pool not active");
+        }
+
+        let ax_token = Self::get_ax_token(env.clone());
+        token::Client::new(&env, &ax_token).transfer(
+            &user,
+            env.current_contract_address(),
+            &amount,
+        );
+
+        let now = env.ledger().timestamp();
+        let key = DataKey::FlexiblePosition(user.clone(), pool_id);
+        let position = if let Some(mut pos) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, FlexiblePosition>(&key)
+        {
+            pos.pending_rewards += calc_flexible_pending(&pos, pool.apy_bps, now);
+            pos.last_reward_ts = now;
+            pos.amount += amount;
+            pos.unlock_at = now + pool.lock_duration;
+            pos
+        } else {
+            FlexiblePosition {
+                user: user.clone(),
+                pool_id,
+                amount,
+                staked_at: now,
+                unlock_at: now + pool.lock_duration,
+                pending_rewards: 0,
+                last_reward_ts: now,
+            }
+        };
+        env.storage().persistent().set(&key, &position);
+        Self::track_user_pool(&env, &user, pool_id);
+
+        pool.total_staked += amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &pool);
+
+        events::emit_flexible_staked(&env, &user, pool_id, amount);
+    }
+
+    /// Claim accrued rewards from a pool without touching principal.
+    pub fn claim_flexible_rewards(env: Env, user: Address, pool_id: u32) -> i128 {
+        Self::require_not_paused(&env);
+        user.require_auth();
+
+        let pool = Self::get_reward_pool(env.clone(), pool_id);
+        let key = DataKey::FlexiblePosition(user.clone(), pool_id);
+        let mut pos: FlexiblePosition = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("no position found");
+
+        let now = env.ledger().timestamp();
+        let accrued = calc_flexible_pending(&pos, pool.apy_bps, now) + pos.pending_rewards;
+        if accrued <= 0 {
+            panic!("no rewards to claim");
+        }
+
+        let reserve: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardPool)
+            .unwrap_or(0);
+        let payout = accrued.min(reserve);
+        if payout == 0 {
+            panic!("reward reserve empty");
+        }
+
+        pos.pending_rewards = 0;
+        pos.last_reward_ts = now;
+        env.storage().persistent().set(&key, &pos);
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardPool, &(reserve - payout));
+
+        let ax_token = Self::get_ax_token(env.clone());
+        token::Client::new(&env, &ax_token).transfer(
+            &env.current_contract_address(),
+            &user,
+            &payout,
+        );
+
+        events::emit_flexible_claimed(&env, &user, pool_id, payout);
+        payout
+    }
+
+    /// Unstake a position in full. Withdrawing a locked pool before
+    /// `unlock_at` forfeits `early_exit_penalty_bps` of principal to the
+    /// treasury (admin); accrued rewards up to now are still paid out.
+    pub fn unstake_flexible(env: Env, user: Address, pool_id: u32) {
+        Self::require_not_paused(&env);
+        user.require_auth();
+
+        let mut pool = Self::get_reward_pool(env.clone(), pool_id);
+        let key = DataKey::FlexiblePosition(user.clone(), pool_id);
+        let pos: FlexiblePosition = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("no position found");
+
+        let now = env.ledger().timestamp();
+        let accrued = calc_flexible_pending(&pos, pool.apy_bps, now) + pos.pending_rewards;
+        let reserve: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardPool)
+            .unwrap_or(0);
+        let reward_payout = accrued.max(0).min(reserve);
+
+        let penalty =
+            early_exit_penalty(pos.amount, pool.early_exit_penalty_bps, now, pos.unlock_at);
+        let principal_out = pos.amount - penalty;
+
+        let ax_token = Self::get_ax_token(env.clone());
+        let client = token::Client::new(&env, &ax_token);
+        client.transfer(&env.current_contract_address(), &user, &principal_out);
+        if reward_payout > 0 {
+            client.transfer(&env.current_contract_address(), &user, &reward_payout);
+            env.storage()
+                .instance()
+                .set(&DataKey::RewardPool, &(reserve - reward_payout));
+        }
+        if penalty > 0 {
+            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+            client.transfer(&env.current_contract_address(), &admin, &penalty);
+        }
+
+        pool.total_staked = (pool.total_staked - pos.amount).max(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &pool);
+        env.storage().persistent().remove(&key);
+
+        events::emit_flexible_unstaked(&env, &user, pool_id, principal_out, penalty);
+    }
+
+    /// View pending rewards for a pool position without claiming.
+    pub fn pending_flexible_rewards(env: Env, user: Address, pool_id: u32) -> i128 {
+        let pool = Self::get_reward_pool(env.clone(), pool_id);
+        let now = env.ledger().timestamp();
+        if let Some(pos) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, FlexiblePosition>(&DataKey::FlexiblePosition(user, pool_id))
+        {
+            calc_flexible_pending(&pos, pool.apy_bps, now) + pos.pending_rewards
+        } else {
+            0
+        }
+    }
+
+    pub fn get_flexible_position(
+        env: Env,
+        user: Address,
+        pool_id: u32,
+    ) -> Option<FlexiblePosition> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FlexiblePosition(user, pool_id))
+    }
+
+    /// List pool ids a user currently (or has ever) staked into.
+    pub fn get_user_pools(env: Env, user: Address) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserPools(user))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn track_user_pool(env: &Env, user: &Address, pool_id: u32) {
+        let key = DataKey::UserPools(user.clone());
+        let mut pools: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !pools.contains(pool_id) {
+            pools.push_back(pool_id);
+            env.storage().persistent().set(&key, &pools);
+        }
+    }
+
+    // ── Validator Penalty / Slashing ─────────────────────────────────────────
+
+    /// Configure the validator slash system. Admin-only.
+    pub fn configure_slashing(env: Env, config: SlashConfig) {
+        Self::require_admin(&env);
+        ValidatorPenaltyManager::configure_slashing(&env, config);
+    }
+
+    /// Slash a validator at the given `severity` (0 = lightest, 4 = heaviest).
+    /// Returns the unique `slash_id` for the event. Admin-only.
+    pub fn slash_validator(
+        env: Env,
+        admin: Address,
+        validator: Address,
+        severity: u32,
+        reason: u32,
+    ) -> BytesN<32> {
+        Self::require_admin(&env);
+        ValidatorPenaltyManager::slash_validator(&env, admin, validator, severity, reason)
+    }
+
+    /// Submit an appeal against a slash. Only the slashed validator may call
+    /// this, and only within the configured `appeal_window_seconds`.
+    pub fn appeal_slash(env: Env, validator: Address, slash_id: BytesN<32>, reason: u32) {
+        ValidatorPenaltyManager::appeal_slash(&env, validator, slash_id, reason);
+    }
+
+    /// Resolve an open appeal. Admin-only.
+    /// Pass `grant = true` to reverse the slash; `false` to deny.
+    pub fn resolve_appeal(env: Env, admin: Address, slash_id: BytesN<32>, grant: bool) {
+        Self::require_admin(&env);
+        ValidatorPenaltyManager::resolve_appeal(&env, admin, slash_id, grant);
+    }
+
+    /// Return the slash history for a validator, or `None` if never slashed.
+    pub fn get_slash_history(env: Env, validator: Address) -> Option<ValidatorSlashHistory> {
+        ValidatorPenaltyManager::get_slash_history(&env, validator)
+    }
+
+    /// Return the `SlashRecord` for a given `slash_id`, or `None` if not found.
+    pub fn get_slash_record(env: Env, slash_id: BytesN<32>) -> Option<SlashRecord> {
+        ValidatorPenaltyManager::get_slash_record(&env, slash_id)
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    /// Pro-rata reward: principal * rate * elapsed / (secs_per_year * 10_000)
+    /// Pro-rata reward: `(amount * annual_rate_bps * elapsed) / (secs_per_year * 10_000)`
+    ///
+    /// Computes accrued rewards for a `RewardStakePosition` based on the annual
+    /// rate (in basis points), seconds elapsed since last snapshot, and the
+    /// staked amount. Uses integer division which truncates toward zero (floor
+    /// for positive values), ensuring rewards never round up and cannot be
+    /// exploited via rounding edge cases.
+    ///
+    /// # Formula
+    /// ```math
+    /// \text{rewards} = \frac{\text{amount} \times \text{annual\_rate\_bps} \times \text{elapsed}}
+    /// {\text{secs\_per\_year} \times 10_000}
+    /// ```
+    ///
+    /// # Precision
+    /// - 1 basis point precision: each unit of `annual_rate_bps` represents
+    ///   0.01% of the amount per year. Dividing by `10_000` (BPS_DENOM) gives
+    ///   exact bps-scale precision.
+    /// - Rounding: Rust's integer division truncates toward zero. For positive
+    ///   values (which is the expected case for stakes), this is equivalent to
+    ///   `floor()`. Rewards always round down, never up — no rounding exploit possible.
+    /// - 12-month verification: when `elapsed = secs_per_year` and
+    ///   `annual_rate_bps = 1200` (12% APY), the result is `amount * 1200 / 10_000`
+    ///   = `amount * 0.12`, confirming the 12-month calculation.
     fn calc_pending(pos: &RewardStakePosition, cfg: &RewardConfig, now: u64) -> i128 {
         let elapsed = now.saturating_sub(pos.last_reward_ts) as i128;
         pos.amount * cfg.annual_rate_bps as i128 * elapsed / (cfg.secs_per_year as i128 * 10_000)
